@@ -220,3 +220,33 @@ class TemporalState:
         if reference < first:
             raise ValueError("age reference cannot precede the first play")
         return reference - first
+
+
+# =============================================================================
+# NOTA ARCHITETTURALE E METODOLOGICA (TemporalState)
+# =============================================================================
+# Questo modulo rappresenta il "Motore Temporale" del simulatore offline.
+# La classe TemporalState è progettata per risolvere due problemi fondamentali
+# della simulazione dei sistemi di raccomandazione sequenziali (CMAB):
+#
+# 1. Prevenzione del Data Leakage (Integrità Causale):
+#    Il metodo `advance_to(timestamp)` fa scivolare l'orologio in avanti
+#    consumando esclusivamente gli eventi strettamente precedenti al decision
+#    point (D_{<t}). Qualsiasi evento al tempo `t` o nel futuro (D_{>=t}) 
+#    rimane invisibile allo stato. Questo garantisce matematicamente che la 
+#    generazione dei candidati e il calcolo del vettore di contesto non 
+#    utilizzino mai informazioni future, emulando un vero ambiente online.
+#
+# 2. Efficienza Computazionale O(1):
+#    Invece di ricalcolare metriche storiche (es. popolarità, history utente)
+#    eseguendo costose query Pandas su milioni di righe a ogni raccomandazione,
+#    lo stato mantiene dizionari globali e locali che si aggiornano in tempo
+#    costante. L'interfaccia di lettura (get_*, is_*) permette a CandidateGenerator
+#    e ContextBuilder di estrarre feature e condizioni di Novelty in O(1).
+#
+# Design Pattern:
+# La classe attua una rigorosa "Separation of Concerns" (SoC). Gestisce 
+# esclusivamente la contabilità del tempo e il tracciamento degli eventi, 
+# delegando le trasformazioni matematiche (come logaritmi e standardizzazione) 
+# al modulo ContextBuilder.
+# =============================================================================

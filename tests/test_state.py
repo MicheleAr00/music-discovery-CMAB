@@ -52,3 +52,29 @@ class TemporalStateSanityTest(unittest.TestCase):
         self.assertEqual(state.get_user_track_count("U1", "T4"), 1)
         self.assertEqual(state.get_track_play_count("T4"), 1)
         self.assertFalse(state.is_artist_novel("U1", "A2"))
+
+# =============================================================================
+# NOTA ARCHITETTURALE E METODOLOGICA (TemporalStateSanityTest)
+# =============================================================================
+# Questo modulo implementa i collaudi unitari (unit tests) fondamentali per
+# validare matematicamente l'integrità del "Motore Temporale" del simulatore.
+#
+# 1. Dimostrazione Matematica (Zero Data Leakage):
+#    I test verificano rigorosamente l'invariante O_t = f(D_{<t}).
+#    Come dimostrato in `test_s1_to_s2_keeps_current_session_event_invisible`,
+#    quando il simulatore si ferma a un decision point (es. 10:20:00), lo stato
+#    assimila perfettamente gli eventi passati della sessione precedente, ma
+#    mantiene rigorosamente invisibile l'evento che innesca la sessione attuale
+#    (10:20:00), prevenendo qualsiasi forma di inquinamento causale.
+#
+# 2. Correttezza dell'Orologio Incrementale:
+#    Garantisce che il metodo `advance_to` aggiorni metriche complesse come 
+#    Recency, Track Age, Novelty e conteggi globali in modo coerente, monotono
+#    e senza duplicazioni.
+#
+# Design Pattern:
+# L'uso del framework nativo `unittest` disaccoppia la validazione metodologica
+# dal dataset reale di 19M di righe. Utilizzando eventi sintetici isolati, 
+# la suite di test fornisce una prova deterministica e riproducibile della 
+# robustezza del sistema, requisito essenziale per un framework accademico.
+# =============================================================================
