@@ -401,3 +401,33 @@ class CandidateGenerator:
             discovery=discovery,
             candidates=tuple(merged.values()),
         )
+
+# =============================================================================
+# NOTA ARCHITETTURALE E METODOLOGICA (CandidateGenerator)
+# =============================================================================
+# Questo modulo implementa la logica di campionamento dello Spazio delle Azioni
+# A_u(t) per il Contextual Bandit. La sua architettura è progettata per
+# abbattere la complessità computazionale del simulatore senza violare i 
+# vincoli temporali.
+#
+# 1. Nessun Future-Leakage Architetturale:
+#    Invece di ricalcolare i pool scansionando interi dataset, il generatore
+#    si iscrive agli aggiornamenti di TemporalState tramite l'Event Listener 
+#    Pattern. Conosce l'esistenza di una traccia o di un artista SOLO nel momento 
+#    esatto in cui lo Stato lo consuma (avanzando nel tempo). Questo blocca
+#    alla radice l'effetto "Global Cold Start" irrealistico.
+#
+# 2. Ottimizzazione Strutturale (Min-Heaps):
+#    Il catalogo di Last.fm è troppo vasto per permettere ordinamenti 
+#    complessivi a ogni singola raccomandazione. L'uso di code di priorità 
+#    (heaps) mutable per popolarità, history e discovery permette l'estrazione
+#    dei Top-N candidati in tempo O(N log N) rispetto a O(C log C) (dove C è 
+#    il catalogo completo).
+#
+# 3. Composizione Dinamica delle Azioni:
+#    L'algoritmo non impone proporzioni euristiche o "magic numbers" 
+#    (es. 30% Pop, 70% Pers) alla raccomandazione finale. Si limita a fonderne 
+#    la disponibilità (fino a 3N). Sarà LinUCB, tramite l'apprendimento sui pesi
+#    \theta, a decidere se estrarre dalla coda `PERSONAL` (exploitation) o 
+#    `DISCOVERY` (exploration) in base al contesto dell'utente in quell'istante.
+# =============================================================================

@@ -263,3 +263,29 @@ class CandidateGeneratorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# =============================================================================
+# NOTA ARCHITETTURALE E METODOLOGICA (CandidateGeneratorTest)
+# =============================================================================
+# Questa suite di unit test garantisce la correttezza semantica e temporale 
+# del modulo di generazione dei candidati (Action Space Sampling).
+#
+# 1. Integrità del Vettore Temporale (Zero Leakage):
+#    I test verificano che nessuna traccia o artista possa entrare nei bacini
+#    di raccomandazione (Personal, Popular, Discovery) se il relativo timestamp
+#    di prima apparizione globale è >= al momento della decisione t. Questo
+#    preserva l'invariante cronologica del simulatore CMAB.
+#
+# 2. Dimostrazione di Equivalenza Strutturale:
+#    Tramite il confronto con un estrattore "naive" a forza bruta, la suite 
+#    dimostra matematicamente che l'uso di strutture dati ottimizzate (Mutable 
+#    Min-Heaps, O(log N)) per la gestione incrementale della popolarità e della 
+#    novelty produce un output deterministicamente identico a una scansione 
+#    lineare completa O(N).
+#
+# 3. Determinismo e Disaccoppiamento:
+#    Il generatore espone un comportamento riproducibile (idempotenza a parità
+#    di stato) e applica rigide regole di deduplicazione delle sorgenti 
+#    preservando l'informazione di discovery (Familiar Artist vs New Artist)
+#    senza sovrapposizioni.
+# =============================================================================

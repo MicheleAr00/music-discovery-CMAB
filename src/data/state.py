@@ -278,4 +278,24 @@ class TemporalState:
 # esclusivamente la contabilità del tempo e il tracciamento degli eventi, 
 # delegando le trasformazioni matematiche (come logaritmi e standardizzazione) 
 # al modulo ContextBuilder.
+#
+# Sviluppi successivi:
+# Dopo la creazione del modulo CandidateGenerator, la scelta architetturale
+# è stata quella di estendere questo modulo trasformandolo in un "Subject" 
+# attivo, aggiungendo tre interfacce per supportare il campionamento asincrono:
+#
+# 3. Pattern Observer (Event Listeners):
+#    Con `add_event_listener`, i moduli esterni si iscrivono agli eventi.
+#    Questo disaccoppia la contabilità temporale dall'estrazione dei candidati,
+#    permettendo al Generatore di aggiornare le sue classifiche in O(log N).
+#
+# 4. Accesso Diretto agli Insiemi (iter_user_artist_ids):
+#    Garantisce un iteratore rapido sulla history artisti di un utente, 
+#    permettendo al Generatore di costruire i pool "Personal" e "Discovery"
+#    senza scansionare iterativamente tutto lo spazio degli eventi passati.
+#
+# 5. Sicurezza Cronologica (Fail-Fast):
+#    Un blocco di sicurezza impedisce le iscrizioni "tardive" ai listener se 
+#    lo stato ha già elaborato eventi. Questo garantisce formalmente che i 
+#    moduli dipendenti non perdano alcun dato storico essenziale.
 # =============================================================================
