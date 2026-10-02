@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import DefaultDict, Iterable, Iterator, Optional
+from typing import Callable, DefaultDict, Iterable, Iterator, Optional
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +47,7 @@ class TemporalState:
         self._last_consumed_timestamp: Optional[datetime] = None
         self._current_time: Optional[datetime] = None
         self._processed_event_count = 0
+        self._event_listeners: list[Callable[[PlayEvent], None]] = []
 
         self._user_event_count: DefaultDict[str, int] = defaultdict(int)
         self._user_track_counts: DefaultDict[str, DefaultDict[str, int]] = defaultdict(
@@ -99,6 +100,9 @@ class TemporalState:
             self._last_consumed_timestamp = event.timestamp
             self._next_event = next(self._events, None)
             consumed += 1
+            if self._event_listeners:
+                for listener in tuple(self._event_listeners):
+                    listener(event)
 
         # Check the next event too, including an event at the decision time.
         if (
@@ -109,6 +113,31 @@ class TemporalState:
             raise ValueError("events must be ordered by nondecreasing timestamp")
         self._current_time = timestamp
         return consumed
+
+    def add_event_listener(self, listener: Callable[[PlayEvent], None]) -> None:
+        """Subscribe to events as they enter the pre-decision state.
+
+        Listeners receive each event only after it has been incorporated by
+        :meth:`advance_to`, whose strict ``event.timestamp < t`` condition
+        therefore also governs every listener. Subscribe before the first
+        event is processed; late subscriptions are rejected because historical
+        events cannot be replayed from this incremental state.
+        """
+        if self._processed_event_count:
+            raise ValueError("event listeners must be registered before processing")
+        if listener not in self._event_listeners:
+            self._event_listeners.append(listener)
+
+    def remove_event_listener(self, listener: Callable[[PlayEvent], None]) -> None:
+        """Remove a previously registered event listener, if present."""
+        try:
+            self._event_listeners.remove(listener)
+        except ValueError:
+            pass
+
+    def iter_user_artist_ids(self, user_id: str) -> Iterator[str]:
+        """Iterate artist keys in the user's pre-decision history."""
+        return iter(self._user_artist_counts.get(user_id, {}))
 
     def _apply(self, event: PlayEvent) -> None:
         user_id, track_id, artist_id = event.user_id, event.track_id, event.artist_id
