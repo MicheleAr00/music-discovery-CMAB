@@ -32,13 +32,30 @@ def resolve_identity_key(identifier: Optional[str], name: Optional[str]) -> str:
     raise ValueError("an entity requires a nonblank ID or name")
 
 
+def resolve_track_identity_key(
+    identifier: Optional[str], artist_name: Optional[str], track_name: Optional[str]
+) -> str:
+    """Resolve a track ID or its namespaced artist-and-track fallback."""
+    if identifier is not None and identifier.strip():
+        return identifier
+    if (
+        artist_name is not None
+        and artist_name.strip()
+        and track_name is not None
+        and track_name.strip()
+    ):
+        return f"name::{artist_name}::{track_name}"
+    raise ValueError("a track requires an ID or both artist and track names")
+
+
 @dataclass(frozen=True, slots=True)
 class TrackMetadata:
     """Track and artist identity fields used by source pools.
 
-    IDs take precedence. Missing IDs fall back to ``name::<name>``; a track
-    name is never used as a bare identity key. Internally observed event keys
-    are stored in the ID fields as already-resolved identity keys.
+    IDs take precedence. A missing track ID falls back to
+    ``name::<artist_name>::<track_name>`` and a missing artist ID to
+    ``name::<artist_name>``. Internally observed event keys are stored in the
+    ID fields as already-resolved identity keys.
     """
 
     track_id: Optional[str]
@@ -49,7 +66,9 @@ class TrackMetadata:
     @property
     def track_key(self) -> str:
         """Canonical track key compatible with ``TemporalState`` queries."""
-        return resolve_identity_key(self.track_id, self.track_name)
+        return resolve_track_identity_key(
+            self.track_id, self.artist_name, self.track_name
+        )
 
     @property
     def artist_key(self) -> str:

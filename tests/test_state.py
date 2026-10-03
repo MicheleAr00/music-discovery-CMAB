@@ -29,6 +29,8 @@ class TemporalStateSanityTest(unittest.TestCase):
         self.assertEqual(state.advance_to(ts("10:20:00")), 3)
         self.assertEqual(state.processed_event_count, 3)
         self.assertEqual(state.get_user_event_count("U1"), 3)
+        self.assertEqual(state.get_user_distinct_track_count("U1"), 3)
+        self.assertEqual(state.get_user_distinct_artist_count("U1"), 2)
         self.assertEqual(state.get_user_track_count("U1", "T1"), 1)
         self.assertEqual(state.get_user_track_count("U1", "T2"), 1)
         self.assertEqual(state.get_user_track_count("U1", "T3"), 1)

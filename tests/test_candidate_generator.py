@@ -115,21 +115,29 @@ class CandidateGeneratorTest(unittest.TestCase):
     def test_name_fallback_is_namespaced_and_ids_take_precedence(self) -> None:
         fallback = TrackMetadata(None, "Fallback Track", None, "Fallback Artist")
         with_id = TrackMetadata("real-id", "Same display name", "artist-id", "Artist")
-        self.assertEqual(fallback.track_key, "name::Fallback Track")
+        self.assertEqual(
+            fallback.track_key, "name::Fallback Artist::Fallback Track"
+        )
         self.assertEqual(fallback.artist_key, "name::Fallback Artist")
         self.assertEqual(with_id.track_key, "real-id")
         self.assertEqual(with_id.artist_key, "artist-id")
 
         events = [
             PlayEvent(
-                "U2", ts(0), "name::Fallback Track", "name::Fallback Artist"
+                "U2",
+                ts(0),
+                "name::Fallback Artist::Fallback Track",
+                "name::Fallback Artist",
             )
         ]
         state = TemporalState(events)
         generator = CandidateGenerator(state)
         state.advance_to(ts(1))
         result = generator.generate("U1", ts(1))
-        self.assertEqual(result.discovery[0].track_key, "name::Fallback Track")
+        self.assertEqual(
+            result.discovery[0].track_key,
+            "name::Fallback Artist::Fallback Track",
+        )
 
     def test_state_must_be_at_exact_decision_time(self) -> None:
         state = TemporalState(fixture())

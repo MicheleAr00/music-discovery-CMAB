@@ -161,6 +161,14 @@ class TemporalState:
         """Return the number of pre-decision events for ``user_id``."""
         return self._user_event_count.get(user_id, 0)
 
+    def get_user_distinct_track_count(self, user_id: str) -> int:
+        """Return the number of distinct tracks in the user's prior history."""
+        return len(self._user_track_counts.get(user_id, {}))
+
+    def get_user_distinct_artist_count(self, user_id: str) -> int:
+        """Return the number of distinct artists in the user's prior history."""
+        return len(self._user_artist_counts.get(user_id, {}))
+
     def get_user_track_count(self, user_id: str, track_id: str) -> int:
         """Return the user's pre-decision play count for a track."""
         return self._user_track_counts.get(user_id, {}).get(track_id, 0)
