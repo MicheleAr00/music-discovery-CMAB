@@ -3,10 +3,11 @@
 from datetime import datetime, timedelta
 import math
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from src.data.state import PlayEvent, TemporalState
-from src.simulation.candidate_generator import CandidateGenerator
+from src.simulation.candidate_generator import CandidateGenerator, CandidatePools
 from src.simulation.context import ContextBuilder
 from src.simulation.linucb import LinUCB
 from src.simulation.reward import RewardCalculator
@@ -187,6 +188,46 @@ class SequentialSimulatorTest(unittest.TestCase):
         u2_record = next(record for record in same_time if record.user_id == "U2")
         self.assertEqual(u2_record.selected_context[0], 0.0)
 
+    def test_simultaneous_decisions_are_invariant_to_boundary_event_order(self) -> None:
+        prefix = [
+            event("U1", BASE, "T0"),
+            event("U2", BASE, "T1", "A2"),
+            event("U1", BASE + timedelta(minutes=20), "T2"),
+            event("U2", BASE + timedelta(minutes=20), "T3", "A2"),
+        ]
+        boundary = [
+            event("U1", VALIDATION_START, "U1_BOUNDARY", "A3"),
+            event("U2", VALIDATION_START, "U2_BOUNDARY", "A4"),
+        ]
+        outputs = []
+        for ordered_boundary in (boundary, list(reversed(boundary))):
+            events = prefix + ordered_boundary + [
+                event("U1", VALIDATION_START + HORIZON, "LATER")
+            ]
+            simulator = build_simulator(events, eligible_users={"U1", "U2"})
+            simulator.prepare_warmup(BASE, BASE + timedelta(days=1))
+            result = simulator.run_phase(
+                "validation", VALIDATION_START, VALIDATION_START + HORIZON
+            )
+            simultaneous = {
+                record.user_id: record
+                for record in result.decisions
+                if record.decision_time == VALIDATION_START
+            }
+            self.assertEqual(set(simultaneous), {"U1", "U2"})
+            for record in simultaneous.values():
+                keys = {candidate.track_key for candidate in record.top_k_candidates}
+                self.assertNotIn("U1_BOUNDARY", keys)
+                self.assertNotIn("U2_BOUNDARY", keys)
+            outputs.append(simultaneous)
+
+        for user_id in ("U1", "U2"):
+            left, right = outputs[0][user_id], outputs[1][user_id]
+            self.assertEqual(left.selected_context, right.selected_context)
+            self.assertEqual(left.selected_track, right.selected_track)
+            self.assertEqual(left.top_k_candidates, right.top_k_candidates)
+            self.assertEqual(left.top_k_scores, right.top_k_scores)
+
     def test_delayed_feedback_is_scheduled_not_applied_at_selection(self) -> None:
         simulator = build_simulator()
         prepare_default_warmup(simulator)
@@ -275,17 +316,58 @@ class SequentialSimulatorTest(unittest.TestCase):
         )
         self.assertTrue(all(record.user_id == "U1" for record in result.decisions))
 
-    def test_empty_candidate_pool_is_logged_as_skipped(self) -> None:
-        future_events = [
-            event("U1", VALIDATION_START, "FIRST"),
-            event("U1", VALIDATION_START + timedelta(days=8), "SECOND"),
+    def test_warmup_scaler_is_independent_of_eligibility_and_future_events(self) -> None:
+        warmup_events = [
+            event("U1", BASE, "T0", "A1"),
+            event("U2", BASE, "T1", "A2"),
+            event("U1", BASE + timedelta(minutes=20), "T2", "A1"),
+            event("U2", BASE + timedelta(minutes=20), "T3", "A2"),
         ]
-        prefit_scaler = FeatureScaler().fit(((0.0,) * 13 + (0.0, 0.0),))
-        simulator = build_simulator(future_events, scaler=prefit_scaler)
-        simulator.prepare_warmup(BASE, BASE + timedelta(days=1))
-        result = simulator.run_phase(
-            "validation", VALIDATION_START, VALIDATION_START + timedelta(days=15)
+        baseline = build_simulator(warmup_events, eligible_users={"U1"})
+        baseline_summary = baseline.prepare_warmup(
+            BASE, BASE + timedelta(days=1)
         )
+
+        with_future = warmup_events + [
+            event("U9", BASE + timedelta(days=2), "FUTURE_ONLY", "A9")
+        ]
+        changed_eligibility = build_simulator(
+            with_future, eligible_users={"U2"}
+        )
+        changed_summary = changed_eligibility.prepare_warmup(
+            BASE, BASE + timedelta(days=1)
+        )
+
+        self.assertEqual(baseline_summary.decision_points, 4)
+        self.assertEqual(changed_summary.decision_points, 4)
+        self.assertEqual(baseline.scaler.mean_, changed_eligibility.scaler.mean_)
+        self.assertEqual(baseline.scaler.scale_, changed_eligibility.scaler.scale_)
+        self.assertEqual(baseline_summary.context_rows, changed_summary.context_rows)
+
+    def test_prepare_warmup_rejects_scaler_without_auditable_provenance(self) -> None:
+        prefit = FeatureScaler().fit(((0.0,) * 13 + (0.0, 0.0),))
+        simulator = build_simulator(scaler=prefit)
+        with self.assertRaisesRegex(RuntimeError, "unfitted FeatureScaler"):
+            prepare_default_warmup(simulator)
+
+    def test_empty_candidate_pool_is_logged_as_skipped(self) -> None:
+        simulator = build_simulator()
+        prepare_default_warmup(simulator)
+        generate = simulator._candidate_generator.generate
+
+        def empty_at_first_decision(user_id, timestamp, pool_depth=50):
+            if timestamp == VALIDATION_START:
+                return CandidatePools((), (), (), ())
+            return generate(user_id, timestamp, pool_depth)
+
+        with patch.object(
+            simulator._candidate_generator,
+            "generate",
+            side_effect=empty_at_first_decision,
+        ):
+            result = simulator.run_phase(
+                "validation", VALIDATION_START, VALIDATION_START + timedelta(days=15)
+            )
         self.assertEqual(result.skipped_decisions, 1)
         skipped = result.decisions[0]
         self.assertEqual(skipped.candidate_count, 0)

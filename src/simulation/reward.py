@@ -72,6 +72,7 @@ class RewardCalculator:
         self._default_horizon = horizon
         _horizon_microseconds(horizon)
         self._timestamps: dict[tuple[str, str], array] = {}
+        self._artists_by_user: dict[str, list[str]] = {}
         self._last_event_time: Optional[int] = None
         self._timezone_aware: Optional[bool] = None
 
@@ -93,6 +94,7 @@ class RewardCalculator:
             if times is None:
                 times = array("q")
                 self._timestamps[key] = times
+                self._artists_by_user.setdefault(event.user_id, []).append(event.artist_id)
             times.append(event_time)
 
     @staticmethod
@@ -172,3 +174,39 @@ class RewardCalculator:
             artist_name=artist_name,
         )
         return math.log1p(count)
+
+    def future_artist_keys(
+        self,
+        user_id: str,
+        decision_time: datetime,
+        horizon: Optional[timedelta] = None,
+    ) -> frozenset[str]:
+        """Return distinct artists listened to in ``(t, t + horizon]``.
+
+        This shares the compact ``(user, artist) -> sorted timestamps`` index
+        used by :meth:`future_count`, allowing offline ranking metrics to get
+        an artist-level recall denominator without rescanning the event table.
+        The query is intended only for evaluation; this future view must not be
+        passed to policy contexts or candidate generation.
+        """
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("user_id must be a nonblank string")
+        if not isinstance(decision_time, datetime):
+            raise ValueError("decision_time must be a datetime")
+        horizon_us = _horizon_microseconds(
+            horizon if horizon is not None else self._default_horizon
+        )
+        aware = _is_aware(decision_time)
+        if self._timezone_aware is not None and aware != self._timezone_aware:
+            raise ValueError(
+                "decision_time must use the same timezone convention as indexed events"
+            )
+        start = _to_epoch_microseconds(decision_time)
+        end = start + horizon_us
+        relevant: set[str] = set()
+        for artist_key in self._artists_by_user.get(user_id, ()):
+            times = self._timestamps[(user_id, artist_key)]
+            first_after_start = bisect_right(times, start)
+            if first_after_start < len(times) and times[first_after_start] <= end:
+                relevant.add(artist_key)
+        return frozenset(relevant)

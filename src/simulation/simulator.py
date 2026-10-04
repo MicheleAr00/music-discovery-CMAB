@@ -92,6 +92,8 @@ class DecisionRecord:
     linucb_mean: Optional[float]
     linucb_exploration: Optional[float]
     feedback_applied_before: int
+    top_k_track_novelty: tuple[bool, ...] = ()
+    top_k_artist_novelty: tuple[bool, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +107,8 @@ class SimulationResult:
     feedback_scheduled: int
     feedback_applied: int
     feedback_pending_at_end: int
+    eligible_catalog: frozenset[str] = frozenset()
+    eligible_artists: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,10 +190,11 @@ class SequentialOfflineBanditSimulator:
     The caller provides the shared chronological event sequence, an already
     computed eligible-user set, and the existing state/policy components.
     ``prepare_warmup`` builds the state/candidate history and fits an unfitted
-    scaler from raw candidate contexts drawn only from warm-up. If the scaler
-    is already fitted externally, warm-up still advances the state but never
-    refits it. Validation and test each start with a fresh LinUCB learner; the
-    same temporal state and candidate index continue across both phases.
+    scaler from raw candidate contexts drawn only from warm-up. Scaler fitting
+    includes all users with warm-up sessions, so sample membership cannot
+    depend on eligibility criteria that may use validation/test activity.
+    Validation and test each start with a fresh LinUCB learner; the same
+    temporal state and candidate index continue across both phases.
     """
 
     def __init__(
@@ -287,12 +292,20 @@ class SequentialOfflineBanditSimulator:
     ) -> WarmupResult:
         """Advance history through warm-up and fit only from warm-up contexts.
 
-        Warm-up samples are all generated candidates for eligible users at
-        warm-up session starts. The scaler counts each candidate occurrence
-        once. No reward is queried/scheduled and no LinUCB update is performed.
+        Warm-up samples are all generated candidates for all users at warm-up
+        session starts. The scaler counts each candidate occurrence once.
+        User eligibility is applied only to validation/test decisions, not to
+        scaler sample membership. No reward is queried/scheduled and no LinUCB
+        update is performed. A pre-fitted scaler is rejected because its
+        provenance cannot be established here.
         """
         if self._warmup_prepared:
             raise RuntimeError("warm-up has already been prepared")
+        if self._scaler.is_fitted:
+            raise RuntimeError(
+                "prepare_warmup requires an unfitted FeatureScaler; "
+                "the simulator owns warm-up-only fitting"
+            )
         if not isinstance(start, datetime) or not isinstance(end, datetime) or end < start:
             raise ValueError("warm-up bounds must be valid datetimes with end >= start")
         if self._state.current_time is not None and self._state.current_time > start:
@@ -308,8 +321,6 @@ class SequentialOfflineBanditSimulator:
                     break
                 self._state.advance_to(timestamp)
                 for session in sessions:
-                    if session.user_id not in self._eligible_users:
-                        continue
                     counts["decisions"] += 1
                     pools, contexts = self._contexts_for_user(session.user_id, timestamp)
                     counts["contexts"] += len(contexts)
@@ -320,11 +331,7 @@ class SequentialOfflineBanditSimulator:
                 self._state.advance_to(self._after_inclusive_time(end))
 
         before_updates = (self._learner.A, self._learner.b)
-        if self._scaler.is_fitted:
-            for _ in warmup_contexts():
-                pass
-        else:
-            self._scaler.fit(warmup_contexts())
+        self._scaler.fit(warmup_contexts())
         if (self._learner.A, self._learner.b) != before_updates:
             raise RuntimeError("warm-up must not update LinUCB")
         self._warmup_prepared = True
@@ -398,6 +405,8 @@ class SequentialOfflineBanditSimulator:
             n_features=self._learner.n_features, alpha=self._learner.alpha
         )
         decisions: list[DecisionRecord] = []
+        eligible_catalog: set[str] = set()
+        eligible_artists: set[str] = set()
         feedback_scheduled = 0
         feedback_applied = 0
         skipped = 0
@@ -422,6 +431,10 @@ class SequentialOfflineBanditSimulator:
             for session in usable_sessions:
                 pools, raw_contexts = self._contexts_for_user(
                     session.user_id, timestamp
+                )
+                eligible_catalog.update(candidate.track_key for candidate in pools.candidates)
+                eligible_artists.update(
+                    candidate.track.artist_key for candidate in pools.candidates
                 )
                 if not pools.candidates:
                     decisions.append(
@@ -497,6 +510,12 @@ class SequentialOfflineBanditSimulator:
                         linucb_mean=top1.mean,
                         linucb_exploration=top1.exploration,
                         feedback_applied_before=feedback_applied,
+                        top_k_track_novelty=tuple(
+                            bool(raw_contexts[item.index][13]) for item in top_k_rows
+                        ),
+                        top_k_artist_novelty=tuple(
+                            bool(raw_contexts[item.index][14]) for item in top_k_rows
+                        ),
                     )
                 )
 
@@ -519,4 +538,6 @@ class SequentialOfflineBanditSimulator:
             feedback_scheduled=feedback_scheduled,
             feedback_applied=feedback_applied,
             feedback_pending_at_end=len(self._pending),
+            eligible_catalog=frozenset(eligible_catalog),
+            eligible_artists=frozenset(eligible_artists),
         )
