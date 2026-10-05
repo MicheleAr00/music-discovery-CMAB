@@ -1,11 +1,15 @@
-"""Artist-aware offline ranking metrics for a single simulation phase.
+"""Track recommendation and artist-level relevance metrics for one phase.
 
-Ranking relevance is binary artist-level relevance in ``(t, t + horizon]``;
-reward remains the simulator's selected-action ``log1p`` feedback. Novelty
-flags are captured from the pre-decision contexts, and phase coverage uses the
-candidate catalog actually exposed by the simulator at evaluated decision
-points. Decision metrics are macro-averaged over users. Coverage follows its
-phase-level set-union definition and is therefore reported as a phase union.
+K first selects the algorithm's Top-K tracks. Relevance evaluation then maps
+those tracks to artists and removes duplicate artists, preserving the first
+track's position. Precision, Recall, NDCG, and Artist Novelty use that ordered
+artist list. Track Novelty and Catalog Coverage continue to use the original
+track list; artist-level ILD applies the specified artist-identity distance to
+all Top-K tracks. Reward remains the simulator's selected-action ``log1p``
+feedback. Novelty flags come from pre-decision contexts, and phase coverage
+uses the candidate catalog actually exposed at evaluated decision points.
+Decision metrics are macro-averaged over users; coverage follows its
+phase-level set-union definition.
 """
 
 from __future__ import annotations
@@ -63,6 +67,24 @@ def _macro_user_summary(
     )
 
 
+def _artist_level_ranking(artist_keys: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    """Deduplicate a Top-K track ranking by artist, preserving first occurrence.
+
+    The returned indices identify the first track representing each artist;
+    those indices are also used to carry its pre-decision Artist Novelty flag.
+    """
+    seen: set[str] = set()
+    ranked_artists: list[str] = []
+    first_track_indices: list[int] = []
+    for index, artist_key in enumerate(artist_keys):
+        if artist_key in seen:
+            continue
+        seen.add(artist_key)
+        ranked_artists.append(artist_key)
+        first_track_indices.append(index)
+    return tuple(ranked_artists), tuple(first_track_indices)
+
+
 class OfflineMetricsEvaluator:
     """Compute ranking, novelty, diversity, coverage, and reward summaries.
 
@@ -79,11 +101,19 @@ class OfflineMetricsEvaluator:
 
     def __init__(
         self,
-        events: Iterable[PlayEvent],
+        events: Optional[Iterable[PlayEvent]] = None,
         *,
         horizon=DEFAULT_REWARD_HORIZON,
+        reward_calculator: Optional[RewardCalculator] = None,
     ) -> None:
-        self._future = RewardCalculator(events, horizon=horizon)
+        if reward_calculator is not None:
+            if events is not None:
+                raise ValueError("provide events or reward_calculator, not both")
+            self._future = reward_calculator
+        elif events is not None:
+            self._future = RewardCalculator(events, horizon=horizon)
+        else:
+            raise ValueError("events or reward_calculator is required")
         self._horizon = horizon
 
     def evaluate(
@@ -92,7 +122,7 @@ class OfflineMetricsEvaluator:
         *,
         k_values: tuple[int, ...] = (5, 10, 20),
     ) -> OfflineMetricsResult:
-        """Evaluate one phase using its stored Top-K ranking and raw flags.
+        """Evaluate one phase using its stored Top-K tracks and raw flags.
 
         ``DecisionRecord`` must contain at least ``min(K, candidate_count)``
         ranked candidates for each requested K. Configure the simulator's
@@ -100,6 +130,11 @@ class OfflineMetricsEvaluator:
         can be larger. Empty candidate lists have undefined precision and
         novelty; they still count as zero-recall misses when future relevance
         exists, and as ILD=0. NDCG is undefined when its ideal DCG is zero.
+
+        K always refers to the first K tracks ranked by the policy. For
+        artist-level metrics, only after taking that track prefix are artist
+        keys deduplicated, preserving their first-occurrence order. Therefore
+        the effective artist ranking can contain fewer than K entries.
         """
         if not isinstance(simulation_result, SimulationResult):
             raise TypeError("simulation_result must be a SimulationResult")
@@ -160,73 +195,91 @@ class OfflineMetricsEvaluator:
             artist_keys = tuple(
                 candidate.track.artist_key for candidate in decision.top_k_candidates
             )
-            item_relevance = tuple(artist in relevant_artists for artist in artist_keys)
 
             if not relevant_artists:
                 recall_excluded += 1
             for k in ks:
                 prefix = min(k, len(decision.top_k_candidates))
                 candidates = decision.top_k_candidates[:prefix]
-                recommended_artists = artist_keys[:prefix]
-                relevant_items = item_relevance[:prefix]
-                list_size = len(candidates)
+                track_artist_keys = artist_keys[:prefix]
+                ranked_artists, first_track_indices = _artist_level_ranking(
+                    track_artist_keys
+                )
+                artist_relevance = tuple(
+                    artist in relevant_artists for artist in ranked_artists
+                )
+                track_list_size = len(candidates)
+                artist_list_size = len(ranked_artists)
                 suffix = f"@{k}"
 
-                # A zero-length list has no precision denominator.
-                if list_size:
-                    add(
-                        f"precision{suffix}",
-                        decision.user_id,
-                        sum(relevant_items) / list_size,
-                    )
+                # Track novelty counts every recommended track independently.
+                if track_list_size:
                     add(
                         f"track_novelty{suffix}",
                         decision.user_id,
-                        sum(decision.top_k_track_novelty[:prefix]) / list_size,
+                        sum(decision.top_k_track_novelty[:prefix]) / track_list_size,
+                    )
+
+                # Precision and Artist Novelty use first-occurrence artists.
+                if artist_list_size:
+                    add(
+                        f"precision{suffix}",
+                        decision.user_id,
+                        sum(artist_relevance) / artist_list_size,
                     )
                     add(
                         f"artist_novelty{suffix}",
                         decision.user_id,
-                        sum(decision.top_k_artist_novelty[:prefix]) / list_size,
+                        sum(
+                            decision.top_k_artist_novelty[index]
+                            for index in first_track_indices
+                        ) / artist_list_size,
                     )
 
-                # Recall counts each relevant artist at most once in the list.
+                # Recall uses the distinct artists in the ordered ranking.
                 if relevant_artists:
-                    hits = len(set(recommended_artists) & relevant_artists)
+                    hits = sum(artist_relevance)
                     add(
                         f"recall{suffix}",
                         decision.user_id,
                         hits / len(relevant_artists),
                     )
 
-                if relevant_artists:
+                if relevant_artists and artist_list_size:
                     dcg = sum(
                         1.0 / math.log2(rank + 2)
-                        for rank, relevant in enumerate(relevant_items)
+                        for rank, relevant in enumerate(artist_relevance)
                         if relevant
                     )
-                    ideal_hits = min(list_size, len(relevant_artists))
+                    ideal_hits = min(artist_list_size, len(relevant_artists))
                     idcg = sum(
                         1.0 / math.log2(rank + 2)
                         for rank in range(ideal_hits)
                     )
                     if idcg > 0.0:
-                        add(f"ndcg{suffix}", decision.user_id, dcg / idcg)
+                        # Binary artist relevance and a deduplicated artist
+                        # ranking guarantee DCG <= IDCG, hence NDCG <= 1.
+                        ndcg = min(1.0, dcg / idcg)
+                        add(f"ndcg{suffix}", decision.user_id, ndcg)
 
-                if list_size < 2:
+                if track_list_size < 2:
                     ild = 0.0
                 else:
                     counts: dict[str, int] = {}
-                    for artist in recommended_artists:
+                    for artist in track_artist_keys:
                         counts[artist] = counts.get(artist, 0) + 1
-                    same_artist_pairs = sum(count * (count - 1) for count in counts.values())
-                    ild = 1.0 - same_artist_pairs / (list_size * (list_size - 1))
+                    same_artist_pairs = sum(
+                        count * (count - 1) for count in counts.values()
+                    )
+                    ild = 1.0 - same_artist_pairs / (
+                        track_list_size * (track_list_size - 1)
+                    )
                 add(f"artist_ild{suffix}", decision.user_id, ild)
 
                 eligible_recommendation_keys[k].update(
                     candidate.track_key for candidate in candidates
                 )
-                eligible_recommendation_artists[k].update(recommended_artists)
+                eligible_recommendation_artists[k].update(ranked_artists)
 
             if decision.reward is not None:
                 add("average_reward", decision.user_id, decision.reward)

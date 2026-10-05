@@ -1,0 +1,34 @@
+{
+  "dataset_path": "Dataset/lastfm-dataset-1K/userid-timestamp-artid-artname-traid-traname.tsv",
+  "dataset_id": "lastfm-dataset-1K",
+  "results_directory": "experiments/results",
+  "seed": 42,
+  "random_seed": 42,
+  "mode": "validation_sweep",
+  "temporal": {
+    "warmup_start": "2005-10-30",
+    "warmup_end": "2008-12-31",
+    "validation_start": "2009-01-01",
+    "validation_end": "2009-02-28",
+    "test_start": "2009-03-01",
+    "test_end": "2009-05-05",
+    "reward_horizon_days": 7,
+    "session_gap_minutes": 10
+  },
+  "n_min": 10,
+  "n_train_unit": "events",
+  "candidate_pool_depths": [50, 100, 200],
+  "k_values": [5, 10, 20],
+  "policies": [
+    "random",
+    "popularity",
+    "greedy",
+    "epsilon_greedy",
+    "linucb"
+  ],
+  "alpha_values": [0.0, 0.1, 0.25, 0.5, 1.0, 2.0],
+  "epsilon_values": [0.05, 0.1, 0.2],
+  "final_parameters": {},
+  "selection_metric": null,
+  "selection_direction": "maximize"
+}

@@ -1,0 +1,54 @@
+# Experiment Runner
+
+`ExperimentConfig` describes a validation sweep or a manually configured
+final-test run. It serializes to JSON, hashes its canonical contents, and
+keeps the frozen warm-up/validation/test dates, seven-day reward horizon,
+ten-minute session gap, pool depths, K values, and policy sweep ranges in one
+place.
+
+```python
+from src.experiments import ExperimentConfig, ExperimentRunner
+from src.experiments.dataset import load_lastfm_tsv
+
+config = ExperimentConfig.from_json("experiments/configs/validation.json")
+events = load_lastfm_tsv(config.dataset_path)
+try:
+    runner = ExperimentRunner(events, config)
+    runs = runner.run_validation_sweep()
+    runner.write_results(runs)
+finally:
+    events.close()
+```
+
+The Last.fm TSV loader makes a disk-backed chronological SQLite cache because
+the bundled source file is reverse ordered. It resolves missing track/artist
+IDs with the identity key convention already used by state and candidate
+generation. The cache is deleted by `close()`.
+
+Eligibility is calculated once and shared by every run. `n_train_unit`
+defaults to `events` (warm-up listens); set it to `decision_points` to count
+warm-up session starts instead. The unit is recorded in every result.
+Validation/test usable counts follow the simulator's current phase rule:
+session decision points whose complete reward horizon fits inside that phase.
+The configured `N_min` threshold is then applied to all three counts.
+
+For each policy/parameter combination, the runner rebuilds an independent
+simulator and scaler from the same events. It asserts that the ordered
+candidate pools and fitted warm-up scaler have matching SHA-256 digests for
+all policies at the same pool depth. Hyperparameter values never affect
+candidate generation. Results include flattened `runs.csv` and detailed
+`runs.jsonl` records under
+`experiments/results/<phase>/<config-hash>-<data-hash>/`.
+
+`run_validation_sweep()` never chooses a parameter. Use
+`rank_validation_results(runs, metric=..., direction=...)` to order validation
+rows for review. `run_final_test()` requires an explicit parameter mapping and
+can be called only once on a runner instance; it constructs fresh per-policy
+simulators, fits only on warm-up, advances observable state to the test period,
+and resets LinUCB before test decisions. No validation learner state is
+carried into test.
+
+No full-dataset experiment is started by importing these modules or loading a
+configuration. The CLI runs only when explicitly invoked with
+`python -m src.experiments.cli <config.json>`. Verify the full pipeline without
+opening the dataset using `python -m src.experiments.cli --smoke`.

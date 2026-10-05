@@ -25,6 +25,7 @@ from src.simulation.context import ContextBuilder, ContextVector
 from src.simulation.linucb import LinUCB
 from src.simulation.reward import DEFAULT_REWARD_HORIZON, RewardCalculator
 from src.simulation.scaler import FeatureScaler
+from src.recommender.policies import CandidatePolicy, LinUCBPolicy
 
 
 DEFAULT_SESSION_GAP = timedelta(minutes=10)
@@ -187,14 +188,19 @@ def _group_by_decision_time(
 class SequentialOfflineBanditSimulator:
     """Orchestrate warm-up, chronological validation/test and delayed updates.
 
-    The caller provides the shared chronological event sequence, an already
-    computed eligible-user set, and the existing state/policy components.
-    ``prepare_warmup`` builds the state/candidate history and fits an unfitted
-    scaler from raw candidate contexts drawn only from warm-up. Scaler fitting
-    includes all users with warm-up sessions, so sample membership cannot
-    depend on eligibility criteria that may use validation/test activity.
-    Validation and test each start with a fresh LinUCB learner; the same
-    temporal state and candidate index continue across both phases.
+    Candidate generation is performed once per decision point. The resulting
+    common candidate tuple and its contexts are passed to the selected policy,
+    which returns both Top-1 and a Top-K evaluation ordering. Only Top-1 is
+    associated with reward and delayed feedback. A legacy ``learner`` argument
+    is wrapped in :class:`LinUCBPolicy`; other implementations are supplied
+    with ``policy=``.
+
+    ``prepare_warmup`` builds the state/candidate history and fits an
+    unfitted scaler from raw candidate contexts drawn only from warm-up.
+    Scaler fitting includes all users with warm-up sessions, so sample
+    membership cannot depend on eligibility criteria that may use
+    validation/test activity. LinUCB resets between phases; the same temporal
+    state and candidate index continue across both.
     """
 
     def __init__(
@@ -205,9 +211,10 @@ class SequentialOfflineBanditSimulator:
         candidate_generator: CandidateGenerator,
         context_builder: ContextBuilder,
         scaler: FeatureScaler,
-        learner: LinUCB,
-        reward_calculator: RewardCalculator,
+        learner: Optional[LinUCB] = None,
+        reward_calculator: Optional[RewardCalculator] = None,
         *,
+        policy: Optional[CandidatePolicy] = None,
         candidate_pool_depth: int = 50,
         top_k: int = 10,
         session_gap: timedelta = DEFAULT_SESSION_GAP,
@@ -237,9 +244,22 @@ class SequentialOfflineBanditSimulator:
         self._candidate_generator = candidate_generator
         self._context_builder = context_builder
         self._scaler = scaler
-        self._learner = learner
-        if learner.n_features != 15:
+        if policy is not None and learner is not None:
+            raise ValueError("provide either policy or learner, not both")
+        if policy is None:
+            if learner is None:
+                raise ValueError("provide a policy or a LinUCB learner")
+            policy = LinUCBPolicy(learner)
+        if not all(
+            callable(getattr(policy, name, None))
+            for name in ("rank", "update", "reset")
+        ):
+            raise TypeError("policy must implement rank, update, and reset")
+        if isinstance(policy, LinUCBPolicy) and policy.learner.n_features != 15:
             raise ValueError("LinUCB n_features must match the 15-feature context")
+        if reward_calculator is None:
+            raise ValueError("reward_calculator is required")
+        self._policy = policy
         self._reward_calculator = reward_calculator
         self._candidate_pool_depth = candidate_pool_depth
         self._top_k = top_k
@@ -258,8 +278,15 @@ class SequentialOfflineBanditSimulator:
 
     @property
     def learner(self) -> LinUCB:
-        """Current phase learner (replaced with a fresh model per phase)."""
-        return self._learner
+        """Current LinUCB model; raises for non-LinUCB policies."""
+        if not isinstance(self._policy, LinUCBPolicy):
+            raise AttributeError("the active policy does not expose a LinUCB learner")
+        return self._policy.learner
+
+    @property
+    def policy(self) -> CandidatePolicy:
+        """The interchangeable policy used for decisions in this simulation."""
+        return self._policy
 
     @property
     def scaler(self) -> FeatureScaler:
@@ -330,9 +357,16 @@ class SequentialOfflineBanditSimulator:
             if self._state.current_time is None or self._state.current_time <= end:
                 self._state.advance_to(self._after_inclusive_time(end))
 
-        before_updates = (self._learner.A, self._learner.b)
+        before_updates = (
+            (self.learner.A, self.learner.b)
+            if isinstance(self._policy, LinUCBPolicy)
+            else None
+        )
         self._scaler.fit(warmup_contexts())
-        if (self._learner.A, self._learner.b) != before_updates:
+        if (
+            before_updates is not None
+            and (self.learner.A, self.learner.b) != before_updates
+        ):
             raise RuntimeError("warm-up must not update LinUCB")
         self._warmup_prepared = True
         return WarmupResult(
@@ -346,7 +380,7 @@ class SequentialOfflineBanditSimulator:
         applied = 0
         while self._pending and self._pending[0][0] <= current_us:
             _, _, feedback = heapq.heappop(self._pending)
-            self._learner.update(feedback.context, feedback.reward)
+            self._policy.update(feedback.context, feedback.reward)
             applied += 1
         return applied
 
@@ -400,10 +434,8 @@ class SequentialOfflineBanditSimulator:
         if self._state.current_time is not None and start < self._state.current_time:
             raise ValueError("phase start precedes the current observable state")
 
-        # The musical history persists; the learner is reset for each phase.
-        self._learner = LinUCB(
-            n_features=self._learner.n_features, alpha=self._learner.alpha
-        )
+        # The musical history persists; each policy controls its own reset.
+        self._policy.reset()
         decisions: list[DecisionRecord] = []
         eligible_catalog: set[str] = set()
         eligible_artists: set[str] = set()
@@ -465,19 +497,29 @@ class SequentialOfflineBanditSimulator:
                 scaled_contexts = tuple(
                     self._scaler.transform(context) for context in raw_contexts
                 )
-                score_rows = self._learner.score_batch(
-                    scaled_contexts,
-                    candidate_ids=(candidate.track_key for candidate in pools.candidates),
+                ranking = self._policy.rank(
+                    pools.candidates,
+                    user_id=session.user_id,
+                    timestamp=timestamp,
+                    state=self._state,
+                    contexts=scaled_contexts,
+                    top_k=self._top_k,
                 )
-                top1 = max(score_rows, key=lambda item: (item.score, -item.index))
-                top_k_rows = tuple(
-                    sorted(score_rows, key=lambda item: (-item.score, item.index))[
-                        : self._top_k
-                    ]
-                )
-                selected = pools.candidates[top1.index]
-                selected_raw_context = raw_contexts[top1.index]
-                selected_scaled_context = scaled_contexts[top1.index]
+                if (
+                    not ranking.top_k_indices
+                    or len(ranking.top_k_indices) > self._top_k
+                    or ranking.top_k_indices[0] != ranking.selected_index
+                    or len(ranking.top_k_indices) != len(ranking.top_k_scores)
+                    or len(set(ranking.top_k_indices)) != len(ranking.top_k_indices)
+                    or any(
+                        index < 0 or index >= len(pools.candidates)
+                        for index in ranking.top_k_indices
+                    )
+                ):
+                    raise ValueError("policy returned an invalid Top-1/Top-K ranking")
+                selected = pools.candidates[ranking.selected_index]
+                selected_raw_context = raw_contexts[ranking.selected_index]
+                selected_scaled_context = scaled_contexts[ranking.selected_index]
                 reward = self._reward_calculator.reward(
                     session.user_id,
                     selected.track.artist_key,
@@ -496,25 +538,27 @@ class SequentialOfflineBanditSimulator:
                         selected_candidate=selected,
                         selected_artist=selected.track.artist_key,
                         selected_track=selected.track_key,
-                        selected_score=top1.score,
+                        selected_score=ranking.top_k_scores[0],
                         selected_context=selected_raw_context,
                         selected_scaled_context=selected_scaled_context,
                         reward=reward,
                         reward_available_time=availability,
                         candidate_count=len(pools.candidates),
                         top_k_candidates=tuple(
-                            pools.candidates[item.index] for item in top_k_rows
+                            pools.candidates[index] for index in ranking.top_k_indices
                         ),
-                        top_k_scores=tuple(item.score for item in top_k_rows),
-                        top_k_effective_size=len(top_k_rows),
-                        linucb_mean=top1.mean,
-                        linucb_exploration=top1.exploration,
+                        top_k_scores=ranking.top_k_scores,
+                        top_k_effective_size=len(ranking.top_k_indices),
+                        linucb_mean=ranking.selected_mean,
+                        linucb_exploration=ranking.selected_exploration,
                         feedback_applied_before=feedback_applied,
                         top_k_track_novelty=tuple(
-                            bool(raw_contexts[item.index][13]) for item in top_k_rows
+                            bool(raw_contexts[index][13])
+                            for index in ranking.top_k_indices
                         ),
                         top_k_artist_novelty=tuple(
-                            bool(raw_contexts[item.index][14]) for item in top_k_rows
+                            bool(raw_contexts[index][14])
+                            for index in ranking.top_k_indices
                         ),
                     )
                 )

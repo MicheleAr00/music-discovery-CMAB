@@ -12,6 +12,7 @@ from src.simulation.candidate_generator import (
 )
 from src.simulation.simulator import DecisionRecord, SimulationResult
 from src.evaluation.metrics import OfflineMetricsEvaluator
+from src.simulation.reward import RewardCalculator
 
 
 T = datetime(2009, 1, 1, 12, 0, 0)
@@ -106,6 +107,23 @@ class OfflineMetricsEvaluatorTests(unittest.TestCase):
         )
         return evaluated[name]
 
+    def test_evaluator_can_share_the_simulators_read_only_future_index(self):
+        rows = [decision("U", [item("T1", "A1")])]
+        future = [event("U", T + timedelta(days=1), "A1")]
+        simulation = result(rows, phase="validation")
+        calculator = RewardCalculator(future, horizon=HORIZON)
+        shared = OfflineMetricsEvaluator(
+            horizon=HORIZON, reward_calculator=calculator
+        ).evaluate(simulation, k_values=(5,))
+        standalone = OfflineMetricsEvaluator(
+            future, horizon=HORIZON
+        ).evaluate(simulation, k_values=(5,))
+        self.assertEqual(shared.metrics, standalone.metrics)
+        with self.assertRaisesRegex(ValueError, "events or reward_calculator"):
+            OfflineMetricsEvaluator(
+                future, horizon=HORIZON, reward_calculator=calculator
+            )
+
     def test_precision_with_fully_relevant_list(self):
         rows = [decision("U", [item("T1", "A1"), item("T2", "A2")])]
         events = [event("U", T + timedelta(days=1), "A1"), event("U", T + timedelta(days=2), "A2")]
@@ -132,6 +150,48 @@ class OfflineMetricsEvaluatorTests(unittest.TestCase):
         ]
         self.assertEqual(self.metric(rows, events, "recall@5").value, 0.5)
 
+    def test_artist_relevance_ranking_deduplicates_in_first_occurrence_order(self):
+        # Top tracks A1, A2, B1 become the ordered artist list A, B.
+        rows = [decision("U", [item("A1", "A"), item("A2", "A"), item("B1", "B")])]
+        events = [event("U", T + timedelta(days=1), "B")]
+        metric = self.metric(rows, events, "ndcg@5")
+        self.assertAlmostEqual(metric.value, 1 / math.log2(3))
+
+    def test_precision_counts_distinct_recommended_artists_not_tracks(self):
+        rows = [
+            decision(
+                "U",
+                [item("A1", "A"), item("A2", "A"), item("B1", "B")],
+            )
+        ]
+        events = [event("U", T + timedelta(days=1), "A")]
+        self.assertEqual(self.metric(rows, events, "precision@5").value, 0.5)
+
+    def test_recall_duplicate_artist_counts_once_in_numerator(self):
+        rows = [decision("U", [item("A1", "A"), item("A2", "A"), item("B1", "B")])]
+        events = [
+            event("U", T + timedelta(days=1), "A"),
+            event("U", T + timedelta(days=2), "B"),
+            event("U", T + timedelta(days=3), "C"),
+        ]
+        self.assertAlmostEqual(self.metric(rows, events, "recall@5").value, 2 / 3)
+
+    def test_ndcg_deduplicates_artist_gains_and_is_bounded_by_one(self):
+        rows = [decision("U", [item("A1", "A"), item("A2", "A"), item("A3", "A")])]
+        events = [event("U", T + timedelta(days=1), "A")]
+        ndcg = self.metric(rows, events, "ndcg@5").value
+        self.assertEqual(ndcg, 1.0)
+        self.assertGreaterEqual(ndcg, 0.0)
+        self.assertLessEqual(ndcg, 1.0)
+
+    def test_all_top_k_tracks_from_one_artist_yield_one_artist_recommendation(self):
+        rows = [decision("U", [item("A1", "A"), item("A2", "A"), item("A3", "A")])]
+        events = [event("U", T + timedelta(days=1), "A")]
+        evaluated = OfflineMetricsEvaluator(events).evaluate(result(rows), k_values=(5,))
+        self.assertEqual(evaluated["precision@5"].value, 1.0)
+        self.assertEqual(evaluated["recall@5"].value, 1.0)
+        self.assertEqual(evaluated["ndcg@5"].value, 1.0)
+
     def test_ndcg_is_one_for_ideal_order(self):
         rows = [decision("U", [item("R1", "A1"), item("R2", "A2"), item("X", "AX")])]
         events = [event("U", T + timedelta(days=1), "A1"), event("U", T + timedelta(days=2), "A2")]
@@ -145,15 +205,15 @@ class OfflineMetricsEvaluatorTests(unittest.TestCase):
 
     def test_track_novelty_uses_logged_predecision_track_flags(self):
         row = decision(
-            "U", [item("T1", "A1"), item("T2", "A2")],
-            track_novelty=(True, False),
+            "U", [item("T1", "A1"), item("T2", "A1"), item("T3", "A2")],
+            track_novelty=(True, False, True),
         )
-        self.assertEqual(self.metric([row], [], "track_novelty@5").value, 0.5)
+        self.assertAlmostEqual(self.metric([row], [], "track_novelty@5").value, 2 / 3)
 
     def test_artist_novelty_uses_logged_predecision_artist_flags(self):
         row = decision(
-            "U", [item("T1", "A1"), item("T2", "A2")],
-            artist_novelty=(False, True),
+            "U", [item("T1", "A1"), item("T2", "A1"), item("T3", "A2")],
+            artist_novelty=(True, False, False),
         )
         self.assertEqual(self.metric([row], [], "artist_novelty@5").value, 0.5)
 
