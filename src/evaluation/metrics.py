@@ -36,7 +36,7 @@ class MetricSummary:
 
 @dataclass(frozen=True, slots=True)
 class OfflineMetricsResult:
-    """Metrics for exactly one validation or test ``SimulationResult``."""
+    """Metrics for one phase, excluding logged decisions with empty pools."""
 
     phase: str
     metrics: Mapping[str, MetricSummary]
@@ -128,8 +128,9 @@ class OfflineMetricsEvaluator:
         ranked candidates for each requested K. Configure the simulator's
         ``top_k`` to at least the largest requested K when the candidate pool
         can be larger. Empty candidate lists have undefined precision and
-        novelty; they still count as zero-recall misses when future relevance
-        exists, and as ILD=0. NDCG is undefined when its ideal DCG is zero.
+        are excluded from all metric aggregation because no recommendation was
+        possible. ``SimulationResult`` still retains those skipped decision
+        records for auditing. NDCG is undefined when its ideal DCG is zero.
 
         K always refers to the first K tracks ranked by the policy. For
         artist-level metrics, only after taking that track prefix are artist
@@ -150,12 +151,12 @@ class OfflineMetricsEvaluator:
                 normalized_k.append(k)
         ks = tuple(sorted(normalized_k))
 
-        decisions = simulation_result.decisions
-        if any(decision.phase != simulation_result.phase for decision in decisions):
+        all_decisions = simulation_result.decisions
+        if any(decision.phase != simulation_result.phase for decision in all_decisions):
             raise ValueError("all decisions must belong to the result phase")
 
         # Check that the stored ranking is long enough to answer every query.
-        for decision in decisions:
+        for decision in all_decisions:
             if decision.top_k_effective_size != len(decision.top_k_candidates):
                 raise ValueError("top_k_effective_size does not match stored candidates")
             for k in ks:
@@ -174,6 +175,10 @@ class OfflineMetricsEvaluator:
                     "DecisionRecord is missing Top-K pre-decision novelty flags; "
                     "rerun the simulator with the metrics-compatible output"
                 )
+
+        decisions = tuple(
+            decision for decision in all_decisions if decision.candidate_count > 0
+        )
 
         per_metric: dict[str, dict[str, list[float]]] = {}
 
@@ -251,7 +256,10 @@ class OfflineMetricsEvaluator:
                         for rank, relevant in enumerate(artist_relevance)
                         if relevant
                     )
-                    ideal_hits = min(artist_list_size, len(relevant_artists))
+                    # IDCG is based on all relevant artists available at the
+                    # requested track cutoff, even when duplicate tracks make
+                    # the deduplicated recommendation ranking shorter.
+                    ideal_hits = min(k, len(relevant_artists))
                     idcg = sum(
                         1.0 / math.log2(rank + 2)
                         for rank in range(ideal_hits)

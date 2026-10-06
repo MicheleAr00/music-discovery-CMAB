@@ -8,9 +8,10 @@ policy cannot silently see a different schedule or candidate union.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timedelta, timezone
 import csv
+from itertools import groupby
 import hashlib
 import itertools
 import json
@@ -20,7 +21,12 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from src.data.state import PlayEvent, TemporalState
 from src.evaluation.metrics import OfflineMetricsEvaluator
-from src.experiments.config import ExperimentConfig
+from src.experiments.config import (
+    DEFAULT_ALPHAS,
+    DEFAULT_EPSILONS,
+    PRIMARY_POOL_DEPTH,
+    ExperimentConfig,
+)
 from src.recommender.policies import (
     EpsilonGreedyPolicy,
     GlobalPopularityPolicy,
@@ -41,6 +47,7 @@ from src.simulation.simulator import (
     WarmupResult,
     iter_session_starts,
 )
+from types import MappingProxyType
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +68,9 @@ class ExperimentRun:
     eligibility_counts: Mapping[str, Mapping[str, int]]
     simulation: SimulationResult
     metrics: Mapping[str, Optional[float]]
+    users_evaluated: int
+    evaluable_decisions: int
+    empty_pool_decisions_excluded: int
     recall_undefined_decisions: int
     warmup: WarmupResult
     runtime_seconds: float
@@ -78,6 +88,8 @@ class ExperimentRun:
             "evaluation_phase": self.evaluation_phase,
             "policy": self.policy,
             "policy_parameters": json.dumps(dict(self.policy_parameters), sort_keys=True),
+            "alpha": self.policy_parameters.get("alpha"),
+            "epsilon": self.policy_parameters.get("epsilon"),
             "dataset": self.dataset_id,
             "dataset_content_hash": self.dataset_content_hash,
             "dataset_path": config.dataset_path,
@@ -95,9 +107,11 @@ class ExperimentRun:
             "N_train_unit": config.n_train_unit,
             "candidate_pool_depth": self.candidate_pool_depth,
             "K_values": ",".join(map(str, self.k_values)),
-            "n_users": len({record.user_id for record in self.simulation.decisions}),
-            "n_decisions": self.simulation.decision_points,
+            "n_users": self.users_evaluated,
+            "n_decisions": self.evaluable_decisions,
+            "n_decision_points_total": self.simulation.decision_points,
             "skipped_decisions": self.simulation.skipped_decisions,
+            "empty_pool_decisions_excluded": self.empty_pool_decisions_excluded,
             "feedback_scheduled": self.simulation.feedback_scheduled,
             "feedback_applied": self.simulation.feedback_applied,
             "feedback_pending_at_end": self.simulation.feedback_pending_at_end,
@@ -128,6 +142,31 @@ class ExperimentRun:
             "candidate_pool_digest": self.candidate_pool_digest,
             "decisions": decisions,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationSelection:
+    """Parameters selected only from validation results at the primary N=100.
+
+    Ties are resolved by higher Average Reward, then ascending parameter
+    value. This object can build the common-N final-test configuration.
+    """
+
+    configuration_hash: str
+    policy_parameters: Mapping[str, Mapping[str, Any]]
+    selected_run_ids: Mapping[str, str]
+    primary_pool_depth: int = PRIMARY_POOL_DEPTH
+    criterion: str = "ndcg@10"
+
+    def __post_init__(self) -> None:
+        if self.primary_pool_depth != PRIMARY_POOL_DEPTH or self.criterion != "ndcg@10":
+            raise ValueError("validation selection must use N=100 and ndcg@10")
+        frozen_parameters = {
+            name: MappingProxyType(dict(parameters))
+            for name, parameters in self.policy_parameters.items()
+        }
+        object.__setattr__(self, "policy_parameters", MappingProxyType(frozen_parameters))
+        object.__setattr__(self, "selected_run_ids", MappingProxyType(dict(self.selected_run_ids)))
 
 
 def _decision_to_dict(record: DecisionRecord) -> dict[str, Any]:
@@ -184,9 +223,8 @@ class ExperimentRunner:
     """Run explicit validation sweeps or final-test configurations.
 
     Eligibility and the temporal split are computed once from the event log
-    and shared across every parameter run. Metrics are ranked only when the
-    caller supplies/accepts the configured criterion; this class never picks
-    a winning hyperparameter automatically.
+    and shared across every parameter run. Sensitivity runs use configured N
+    values; selection is restricted to validation results at the fixed N=100.
     """
 
     def __init__(self, events: Sequence[PlayEvent], config: ExperimentConfig) -> None:
@@ -217,11 +255,6 @@ class ExperimentRunner:
         self,
     ) -> tuple[frozenset[str], dict[str, dict[str, int]], str]:
         """Count configured training units and phase-usable decision points."""
-        if self.config.n_train_unit is None:
-            raise ValueError(
-                "n_train_unit must be explicitly set to 'events' or 'decision_points' "
-                "before eligibility is computed"
-            )
         protocol = self.config.temporal
         warm_start, warm_end = protocol.warmup_bounds
         val_start, val_end = protocol.validation_bounds
@@ -239,14 +272,39 @@ class ExperimentRunner:
             if self.config.n_train_unit == "events" and warm_start <= event.timestamp <= warm_end:
                 row = counts.setdefault(event.user_id, {"train": 0, "validation_usable": 0, "test_usable": 0})
                 row["train"] += 1
-        for session in iter_session_starts(self.events, protocol.session_gap):
-            row = counts.setdefault(session.user_id, {"train": 0, "validation_usable": 0, "test_usable": 0})
-            if self.config.n_train_unit == "decision_points" and warm_start <= session.decision_time <= warm_end:
-                row["train"] += 1
-            if val_start <= session.decision_time <= val_end and session.decision_time + protocol.reward_horizon <= val_end:
-                row["validation_usable"] += 1
-            if test_start <= session.decision_time <= test_end and session.decision_time + protocol.reward_horizon <= test_end:
-                row["test_usable"] += 1
+        eligibility_state = TemporalState(self.events)
+        eligibility_generator = CandidateGenerator(eligibility_state)
+        sessions = iter_session_starts(self.events, protocol.session_gap)
+        for timestamp, group_iter in groupby(sessions, key=lambda row: row.decision_time):
+            group = tuple(group_iter)
+            eligibility_state.advance_to(timestamp)
+            for session in group:
+                row = counts.setdefault(session.user_id, {"train": 0, "validation_usable": 0, "test_usable": 0})
+                phase_counter = None
+                phase_end = None
+                if val_start <= timestamp <= val_end:
+                    phase_counter, phase_end = "validation_usable", val_end
+                elif test_start <= timestamp <= test_end:
+                    phase_counter, phase_end = "test_usable", test_end
+                if (
+                    phase_counter is not None
+                    and phase_end is not None
+                    and timestamp + protocol.reward_horizon <= phase_end
+                ):
+                    # Eligibility is shared across configured N values. A
+                    # point must have an action in every compared candidate
+                    # pool; empty pools never count as usable.
+                    has_candidates_at_every_depth = all(
+                        eligibility_generator.generate(
+                            session.user_id, timestamp, depth
+                        ).candidates
+                        for depth in self.config.candidate_pool_depths
+                    )
+                    if has_candidates_at_every_depth:
+                        row[phase_counter] += 1
+            # Keep all simultaneous session starts on the same strict-past
+            # state, then reveal their boundary events for later timestamps.
+            eligibility_state.advance_to(timestamp + timedelta(microseconds=1))
 
         eligible = frozenset(
             user_id for user_id, row in counts.items()
@@ -257,7 +315,7 @@ class ExperimentRunner:
         return eligible, counts, dataset_digest.hexdigest()
 
     def run_validation_sweep(self) -> tuple[ExperimentRun, ...]:
-        """Run all configured validation combinations, without auto-selection."""
+        """Run the complete configured grid, including N sensitivity values."""
         if self.config.mode != "validation_sweep":
             raise ValueError("run_validation_sweep requires mode='validation_sweep'")
         if not self.eligible_users:
@@ -277,7 +335,7 @@ class ExperimentRunner:
         return tuple(runs)
 
     def run_final_test(self) -> tuple[ExperimentRun, ...]:
-        """Run one manually selected parameterization per policy on test only."""
+        """Run one explicitly selected, common-N parameterization per policy."""
         if self.config.mode != "final_test":
             raise ValueError("run_final_test requires mode='final_test'")
         if self._final_test_completed:
@@ -286,6 +344,8 @@ class ExperimentRunner:
             raise ValueError("no users satisfy the configured N_min eligibility rule")
         if len(self.config.candidate_pool_depths) != 1:
             raise ValueError("final_test requires exactly one selected candidate_pool_depth")
+        if self.config.candidate_pool_depths != (PRIMARY_POOL_DEPTH,):
+            raise ValueError("final_test requires the common primary candidate_pool_depth N=100")
         missing = set(self.config.policies) - set(self.config.final_parameters)
         extra = set(self.config.final_parameters) - set(self.config.policies)
         if missing or extra:
@@ -295,6 +355,10 @@ class ExperimentRunner:
         expected_signatures = None
         for policy_name in self.config.policies:
             params = dict(self.config.final_parameters[policy_name])
+            if policy_name == "linucb" and float(params.get("alpha", -1.0)) not in DEFAULT_ALPHAS:
+                raise ValueError(f"final LinUCB alpha must come from {DEFAULT_ALPHAS}")
+            if policy_name == "epsilon_greedy" and float(params.get("epsilon", -1.0)) not in DEFAULT_EPSILONS:
+                raise ValueError(f"final epsilon must come from {DEFAULT_EPSILONS}")
             run = self._run_one("test", policy_name, params, depth)
             signatures = (run.candidate_pool_digest, run.scaler_digest)
             if expected_signatures is None:
@@ -304,6 +368,115 @@ class ExperimentRunner:
             runs.append(run)
         self._final_test_completed = True
         return tuple(runs)
+
+    def select_validation_parameters(
+        self, runs: Sequence[ExperimentRun]
+    ) -> ValidationSelection:
+        """Select alpha and epsilon from validation at N=100 only.
+
+        N=50 and N=200 runs are ignored for parameter selection and remain
+        descriptive sensitivity analyses. The selector accepts validation
+        rows only, so test metrics cannot influence this decision.
+        """
+        if self.config.mode != "validation_sweep":
+            raise ValueError("parameter selection requires mode='validation_sweep'")
+        if not runs:
+            raise ValueError("validation results are required for parameter selection")
+        if any(run.evaluation_phase != "validation" for run in runs):
+            raise ValueError("selection accepts validation results only; test results are forbidden")
+        if any(run.configuration_hash != self.config.configuration_hash for run in runs):
+            raise ValueError("validation results do not match this ExperimentConfig")
+        if any(run.dataset_content_hash != self.dataset_content_hash for run in runs):
+            raise ValueError("validation results do not match this dataset")
+
+        primary_runs = tuple(
+            run for run in runs if run.candidate_pool_depth == PRIMARY_POOL_DEPTH
+        )
+        selected: dict[str, Mapping[str, Any]] = {}
+        selected_ids: dict[str, str] = {}
+        for policy in self.config.policies:
+            candidates = tuple(run for run in primary_runs if run.policy == policy)
+            if not candidates:
+                raise ValueError(f"missing N=100 validation results for policy {policy!r}")
+            if policy == "linucb":
+                expected = {float(value) for value in self.config.alpha_values}
+                observed = {
+                    float(run.policy_parameters["alpha"])
+                    for run in candidates
+                    if "alpha" in run.policy_parameters
+                }
+                if observed != expected or len(candidates) != len(expected):
+                    raise ValueError("N=100 LinUCB results must cover every configured alpha exactly once")
+            elif policy == "epsilon_greedy":
+                expected = {float(value) for value in self.config.epsilon_values}
+                observed = {
+                    float(run.policy_parameters["epsilon"])
+                    for run in candidates
+                    if "epsilon" in run.policy_parameters
+                }
+                if observed != expected or len(candidates) != len(expected):
+                    raise ValueError("N=100 epsilon-greedy results must cover every configured epsilon exactly once")
+            elif len(candidates) != 1:
+                raise ValueError(f"non-tunable policy {policy!r} must have one N=100 validation result")
+
+            winner = (
+                self._best_validation_run(candidates)
+                if policy in {"linucb", "epsilon_greedy"}
+                else candidates[0]
+            )
+            selected[policy] = dict(winner.policy_parameters)
+            selected_ids[policy] = winner.run_id
+
+        return ValidationSelection(
+            configuration_hash=self.config.configuration_hash,
+            policy_parameters=selected,
+            selected_run_ids=selected_ids,
+        )
+
+    @staticmethod
+    def _best_validation_run(runs: Sequence[ExperimentRun]) -> ExperimentRun:
+        """Order by NDCG@10, Average Reward, then lower parameter value."""
+        scored = [run for run in runs if run.metrics.get("ndcg@10") is not None]
+        if not scored:
+            raise ValueError("NDCG@10 is undefined for every candidate configuration")
+
+        def parameter_order(run: ExperimentRun) -> tuple[float, str]:
+            parameter = run.policy_parameters.get("alpha", run.policy_parameters.get("epsilon"))
+            return (float(parameter) if parameter is not None else -1.0, run.policy)
+
+        def key(run: ExperimentRun) -> tuple[Any, ...]:
+            reward = run.metrics.get("average_reward")
+            return (
+                -float(run.metrics["ndcg@10"]),
+                reward is None,
+                -float(reward) if reward is not None else 0.0,
+                *parameter_order(run),
+                run.run_id,
+            )
+
+        return min(scored, key=key)
+
+    def make_final_test_config(
+        self, selection: ValidationSelection
+    ) -> ExperimentConfig:
+        """Build the one-shot N=100 test config from this validation selection."""
+        if self.config.mode != "validation_sweep":
+            raise ValueError("a final-test config can be built only from a validation runner")
+        if selection.configuration_hash != self.config.configuration_hash:
+            raise ValueError("selection was produced from a different validation config")
+        if set(selection.policy_parameters) != set(self.config.policies):
+            raise ValueError("selection must provide one parameter mapping for every configured policy")
+        return replace(
+            self.config,
+            mode="final_test",
+            candidate_pool_depths=(PRIMARY_POOL_DEPTH,),
+            final_parameters={
+                name: dict(parameters)
+                for name, parameters in selection.policy_parameters.items()
+            },
+            selection_metric="ndcg@10",
+            selection_direction="maximize",
+        )
 
     def _validation_policy_grid(self) -> Iterable[tuple[str, dict[str, Any]]]:
         for name in self.config.policies:
@@ -415,6 +588,11 @@ class ExperimentRunner:
             eligibility_counts=self.eligibility_counts,
             simulation=simulation,
             metrics=metrics,
+            users_evaluated=evaluated.users_evaluated,
+            evaluable_decisions=evaluated.decisions_evaluated,
+            empty_pool_decisions_excluded=sum(
+                record.candidate_count == 0 for record in simulation.decisions
+            ),
             recall_undefined_decisions=evaluated.recall_excluded_decisions,
             warmup=warmup,
             runtime_seconds=perf_counter() - started,
@@ -427,29 +605,34 @@ class ExperimentRunner:
         self,
         runs: Sequence[ExperimentRun],
         *,
-        metric: Optional[str] = None,
-        direction: Optional[str] = None,
+        candidate_pool_depth: int = PRIMARY_POOL_DEPTH,
     ) -> tuple[ExperimentRun, ...]:
-        """Order runs by an explicit metric, placing undefined values last.
+        """Order validation rows by NDCG@10, then frozen tie-breaks.
 
-        This is a presentation operation only and never selects parameters or
-        launches a test run. A criterion is mandatory either here or in config.
+        The default N=100 view is the primary selection table. Passing 50 or
+        200 creates a descriptive sensitivity-analysis ranking only.
         """
-        metric = metric or self.config.selection_metric
-        direction = direction or self.config.selection_direction
-        if not metric:
-            raise ValueError("specify a selection metric before ranking validation results")
         if any(run.evaluation_phase != "validation" for run in runs):
             raise ValueError("only validation results may be ranked for parameter review")
-        if direction not in {"maximize", "minimize"}:
-            raise ValueError("direction must be maximize or minimize")
-        sign = -1.0 if direction == "maximize" else 1.0
-        return tuple(sorted(runs, key=lambda run: (
-            run.metrics.get(metric) is None,
-            sign * run.metrics[metric] if run.metrics.get(metric) is not None else 0.0,
+        if candidate_pool_depth not in {50, 100, 200}:
+            raise ValueError("candidate_pool_depth must be 50, 100, or 200")
+        rows = tuple(run for run in runs if run.candidate_pool_depth == candidate_pool_depth)
+        return tuple(sorted(rows, key=self._best_validation_sort_key))
+
+    @staticmethod
+    def _best_validation_sort_key(run: ExperimentRun) -> tuple[Any, ...]:
+        ndcg = run.metrics.get("ndcg@10")
+        reward = run.metrics.get("average_reward")
+        parameter = run.policy_parameters.get("alpha", run.policy_parameters.get("epsilon"))
+        return (
+            ndcg is None,
+            -float(ndcg) if ndcg is not None else 0.0,
+            reward is None,
+            -float(reward) if reward is not None else 0.0,
+            float(parameter) if parameter is not None else -1.0,
             run.policy,
-            json.dumps(dict(run.policy_parameters), sort_keys=True),
-        )))
+            run.run_id,
+        )
 
     def write_results(
         self, runs: Sequence[ExperimentRun], output_directory: str | Path | None = None

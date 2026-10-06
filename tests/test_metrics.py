@@ -124,6 +124,23 @@ class OfflineMetricsEvaluatorTests(unittest.TestCase):
                 future, horizon=HORIZON, reward_calculator=calculator
             )
 
+    def test_empty_candidate_decision_is_excluded_from_metric_aggregation(self):
+        valid = decision("U1", [item("T1", "A1")], reward=0.75)
+        empty = decision("U2", [], reward=None)
+        events = [
+            event("U1", T + timedelta(days=1), "A1"),
+            event("U2", T + timedelta(days=1), "A2"),
+        ]
+        evaluator = OfflineMetricsEvaluator(events)
+        only_valid = evaluator.evaluate(result([valid]), k_values=(5,))
+        with_empty = evaluator.evaluate(result([valid, empty]), k_values=(5,))
+        self.assertEqual(with_empty.decisions_evaluated, 1)
+        self.assertEqual(with_empty.users_evaluated, 1)
+        self.assertEqual(2 - with_empty.decisions_evaluated, 1)
+        self.assertEqual(with_empty.metrics, only_valid.metrics)
+        self.assertEqual(with_empty["precision@5"].value, 1.0)
+        self.assertEqual(with_empty["recall@5"].value, 1.0)
+
     def test_precision_with_fully_relevant_list(self):
         rows = [decision("U", [item("T1", "A1"), item("T2", "A2")])]
         events = [event("U", T + timedelta(days=1), "A1"), event("U", T + timedelta(days=2), "A2")]
@@ -191,6 +208,18 @@ class OfflineMetricsEvaluatorTests(unittest.TestCase):
         self.assertEqual(evaluated["precision@5"].value, 1.0)
         self.assertEqual(evaluated["recall@5"].value, 1.0)
         self.assertEqual(evaluated["ndcg@5"].value, 1.0)
+
+    def test_ndcg_ideal_uses_all_relevant_artists_when_deduped_ranking_is_shorter(self):
+        rows = [decision("U", [item("A1", "A"), item("A2", "A"), item("A3", "A")])]
+        events = [
+            event("U", T + timedelta(days=1), "A"),
+            event("U", T + timedelta(days=2), "B"),
+            event("U", T + timedelta(days=3), "C"),
+        ]
+        ndcg = self.metric(rows, events, "ndcg@5").value
+        expected = 1.0 / sum(1.0 / math.log2(rank + 2) for rank in range(3))
+        self.assertAlmostEqual(ndcg, expected)
+        self.assertLess(ndcg, 1.0)
 
     def test_ndcg_is_one_for_ideal_order(self):
         rows = [decision("U", [item("R1", "A1"), item("R2", "A2"), item("X", "AX")])]

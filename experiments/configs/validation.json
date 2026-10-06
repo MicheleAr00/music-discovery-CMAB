@@ -29,6 +29,6 @@
   "alpha_values": [0.0, 0.1, 0.25, 0.5, 1.0, 2.0],
   "epsilon_values": [0.05, 0.1, 0.2],
   "final_parameters": {},
-  "selection_metric": null,
+  "selection_metric": "ndcg@10",
   "selection_direction": "maximize"
 }

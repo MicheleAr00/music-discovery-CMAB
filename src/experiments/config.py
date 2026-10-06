@@ -18,6 +18,7 @@ from typing import Any, Mapping
 
 DEFAULT_POLICIES = ("random", "popularity", "greedy", "epsilon_greedy", "linucb")
 SUPPORTED_POOL_DEPTHS = (50, 100, 200)
+PRIMARY_POOL_DEPTH = 100
 SUPPORTED_K_VALUES = (5, 10, 20)
 DEFAULT_ALPHAS = (0.0, 0.1, 0.25, 0.5, 1.0, 2.0)
 DEFAULT_EPSILONS = (0.05, 0.10, 0.20)
@@ -106,12 +107,11 @@ class TemporalProtocol:
 
 @dataclass(frozen=True, slots=True)
 class ExperimentConfig:
-    """Complete run configuration; parameter selection is always explicit.
+    """Complete run configuration for validation sweeps or the one-shot test.
 
-    ``mode`` is ``validation_sweep`` or ``final_test``. Validation values are
-    ranked for inspection only; no best parameter is selected automatically.
-    Final test requires a single explicit ``final_parameters`` entry per
-    configured policy.
+    Validation evaluates all configured candidate-pool depths as sensitivity
+    analysis. Parameter selection is restricted to the primary depth N=100.
+    Final-test configurations must use N=100 for every policy.
     """
 
     dataset_path: str = "Dataset/lastfm-dataset-1K/userid-timestamp-artid-artname-traid-traname.tsv"
@@ -122,14 +122,14 @@ class ExperimentConfig:
     mode: str = "validation_sweep"
     temporal: TemporalProtocol = field(default_factory=TemporalProtocol)
     n_min: int = 10
-    n_train_unit: str | None = "events"
-    candidate_pool_depths: tuple[int, ...] = (50,)
+    n_train_unit: str = "events"
+    candidate_pool_depths: tuple[int, ...] = (PRIMARY_POOL_DEPTH,)
     k_values: tuple[int, ...] = (5, 10, 20)
     policies: tuple[str, ...] = DEFAULT_POLICIES
     alpha_values: tuple[float, ...] = DEFAULT_ALPHAS
     epsilon_values: tuple[float, ...] = DEFAULT_EPSILONS
     final_parameters: Mapping[str, Mapping[str, float | int]] = field(default_factory=dict)
-    selection_metric: str | None = None
+    selection_metric: str = "ndcg@10"
     selection_direction: str = "maximize"
 
     def __post_init__(self) -> None:
@@ -137,8 +137,8 @@ class ExperimentConfig:
             raise ValueError("mode must be validation_sweep or final_test")
         if isinstance(self.n_min, bool) or not isinstance(self.n_min, int) or self.n_min <= 0:
             raise ValueError("n_min must be a positive integer")
-        if self.n_train_unit not in {None, "events", "decision_points"}:
-            raise ValueError("n_train_unit must be events, decision_points, or unset")
+        if self.n_train_unit != "events":
+            raise ValueError("the frozen N_train unit is events")
         if not self.dataset_path.strip() or not self.dataset_id.strip():
             raise ValueError("dataset_path and dataset_id must be nonblank")
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
@@ -151,6 +151,8 @@ class ExperimentConfig:
             raise ValueError(f"candidate_pool_depths must use {SUPPORTED_POOL_DEPTHS}")
         if len(set(self.candidate_pool_depths)) != len(self.candidate_pool_depths):
             raise ValueError("candidate_pool_depths must not contain duplicates")
+        if self.mode == "validation_sweep" and PRIMARY_POOL_DEPTH not in self.candidate_pool_depths:
+            raise ValueError("validation_sweep must include the fixed primary candidate_pool_depth N=100")
         _positive_unique(self.k_values, "k_values")
         if set(self.k_values) - set(SUPPORTED_K_VALUES):
             raise ValueError(f"k_values must use {SUPPORTED_K_VALUES}")
@@ -163,16 +165,34 @@ class ExperimentConfig:
             for value in self.alpha_values
         ):
             raise ValueError("alpha_values must be nonempty and nonnegative")
+        if len(set(float(value) for value in self.alpha_values)) != len(self.alpha_values):
+            raise ValueError("alpha_values must not contain duplicates")
+        if set(float(value) for value in self.alpha_values) - set(DEFAULT_ALPHAS):
+            raise ValueError(f"alpha_values may only use the frozen grid {DEFAULT_ALPHAS}")
         if not self.epsilon_values or any(
             isinstance(value, bool) or not isinstance(value, (int, float))
             or not math.isfinite(value) or not 0 <= value <= 1
             for value in self.epsilon_values
         ):
             raise ValueError("epsilon_values must be nonempty and in [0, 1]")
-        if self.selection_direction not in {"maximize", "minimize"}:
-            raise ValueError("selection_direction must be maximize or minimize")
+        if len(set(float(value) for value in self.epsilon_values)) != len(self.epsilon_values):
+            raise ValueError("epsilon_values must not contain duplicates")
+        if set(float(value) for value in self.epsilon_values) - set(DEFAULT_EPSILONS):
+            raise ValueError(f"epsilon_values may only use the frozen grid {DEFAULT_EPSILONS}")
+        if self.mode == "validation_sweep" and "linucb" in self.policies:
+            if set(float(value) for value in self.alpha_values) != set(DEFAULT_ALPHAS):
+                raise ValueError(f"validation LinUCB must use the full frozen alpha grid {DEFAULT_ALPHAS}")
+        if self.mode == "validation_sweep" and "epsilon_greedy" in self.policies:
+            if set(float(value) for value in self.epsilon_values) != set(DEFAULT_EPSILONS):
+                raise ValueError(f"validation epsilon-greedy must use the full frozen epsilon grid {DEFAULT_EPSILONS}")
+        if self.selection_metric != "ndcg@10":
+            raise ValueError("the frozen selection metric is ndcg@10")
+        if self.selection_direction != "maximize":
+            raise ValueError("the frozen selection direction is maximize")
         if self.mode == "final_test" and not self.final_parameters:
             raise ValueError("final_test requires explicitly selected final_parameters")
+        if self.mode == "final_test" and self.candidate_pool_depths != (PRIMARY_POOL_DEPTH,):
+            raise ValueError("final_test requires the common primary candidate_pool_depth N=100")
         if self.mode == "validation_sweep" and self.final_parameters:
             raise ValueError("final_parameters belongs only to final_test configuration")
 
