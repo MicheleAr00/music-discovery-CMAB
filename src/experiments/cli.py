@@ -32,6 +32,7 @@ def main() -> None:
     if not dataset_path.is_absolute():
         dataset_path = args.config.resolve().parent.parent.parent / dataset_path
     events = load_lastfm_tsv(dataset_path)
+    runner = None
     try:
         runner = ExperimentRunner(events, config)
         runs = (
@@ -45,6 +46,8 @@ def main() -> None:
         print(f"Results: {csv_path}")
         print(f"Detailed records: {jsonl_path}")
     finally:
+        if runner is not None:
+            runner.close()
         events.close()
 
 

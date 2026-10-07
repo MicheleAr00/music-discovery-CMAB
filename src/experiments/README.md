@@ -12,13 +12,21 @@ from src.experiments.dataset import load_lastfm_tsv
 
 config = ExperimentConfig.from_json("experiments/configs/validation.json")
 events = load_lastfm_tsv(config.dataset_path)
+runner = None
 try:
     runner = ExperimentRunner(events, config)
     runs = runner.run_validation_sweep()
     runner.write_results(runs)
 finally:
+    if runner is not None:
+        runner.close()
     events.close()
 ```
+
+Validation sweeps keep only compact run summaries in memory. Full per-decision
+records are streamed to temporary files and copied into `runs.jsonl` by
+`write_results()`. Keep the runner open until results have been written, then
+call `runner.close()` to remove its temporary detail files.
 
 The Last.fm TSV loader makes a disk-backed chronological SQLite cache because
 the bundled source file is reverse ordered. It resolves missing track/artist

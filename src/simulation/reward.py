@@ -60,8 +60,11 @@ class RewardCalculator:
     available, otherwise ``name::<artist_name>``). Timestamps are stored in
     compact sorted integer-microsecond arrays indexed by ``(user, artist)``.
 
-    Query cost is O(log m), where m is the number of indexed events for that
-    user-artist pair; index construction is O(n) over chronological input.
+    ``future_count`` costs O(log m), where m is the number of indexed events
+    for that user-artist pair. ``future_artist_keys`` uses a separate compact
+    per-user chronological event index and costs O(log E_u + H_u), where E_u
+    is that user's event count and H_u is the number of events in the queried
+    horizon. Both indexes are evaluation-only and isolated from policy state.
     """
 
     def __init__(
@@ -72,7 +75,10 @@ class RewardCalculator:
         self._default_horizon = horizon
         _horizon_microseconds(horizon)
         self._timestamps: dict[tuple[str, str], array] = {}
-        self._artists_by_user: dict[str, list[str]] = {}
+        self._artist_indices: dict[str, int] = {}
+        self._artist_keys: list[str] = []
+        self._user_event_times: dict[str, array] = {}
+        self._user_event_artist_indices: dict[str, array] = {}
         self._last_event_time: Optional[int] = None
         self._timezone_aware: Optional[bool] = None
 
@@ -94,8 +100,14 @@ class RewardCalculator:
             if times is None:
                 times = array("q")
                 self._timestamps[key] = times
-                self._artists_by_user.setdefault(event.user_id, []).append(event.artist_id)
+            artist_index = self._artist_indices.get(event.artist_id)
+            if artist_index is None:
+                artist_index = len(self._artist_keys)
+                self._artist_indices[event.artist_id] = artist_index
+                self._artist_keys.append(event.artist_id)
             times.append(event_time)
+            self._user_event_times.setdefault(event.user_id, array("q")).append(event_time)
+            self._user_event_artist_indices.setdefault(event.user_id, array("I")).append(artist_index)
 
     @staticmethod
     def _validate_event(event: PlayEvent) -> None:
@@ -183,11 +195,13 @@ class RewardCalculator:
     ) -> frozenset[str]:
         """Return distinct artists listened to in ``(t, t + horizon]``.
 
-        This shares the compact ``(user, artist) -> sorted timestamps`` index
-        used by :meth:`future_count`, allowing offline ranking metrics to get
-        an artist-level recall denominator without rescanning the event table.
-        The query is intended only for evaluation; this future view must not be
-        passed to policy contexts or candidate generation.
+        The query bisects one chronological timestamp array for the user, then
+        visits only events in the requested interval and deduplicates their
+        compact artist ordinals. This avoids scanning every distinct artist
+        the user has ever heard on each decision. The index is owned solely by
+        the offline evaluator: it is not exposed to ``TemporalState``, context
+        construction, or candidate generation, so it cannot affect policy
+        observations or candidate pools.
         """
         if not isinstance(user_id, str) or not user_id.strip():
             raise ValueError("user_id must be a nonblank string")
@@ -203,10 +217,11 @@ class RewardCalculator:
             )
         start = _to_epoch_microseconds(decision_time)
         end = start + horizon_us
-        relevant: set[str] = set()
-        for artist_key in self._artists_by_user.get(user_id, ()):
-            times = self._timestamps[(user_id, artist_key)]
-            first_after_start = bisect_right(times, start)
-            if first_after_start < len(times) and times[first_after_start] <= end:
-                relevant.add(artist_key)
-        return frozenset(relevant)
+        times = self._user_event_times.get(user_id)
+        artist_indices = self._user_event_artist_indices.get(user_id)
+        if times is None or artist_indices is None:
+            return frozenset()
+        first = bisect_right(times, start)
+        stop = bisect_right(times, end)
+        relevant_indices = {artist_indices[index] for index in range(first, stop)}
+        return frozenset(self._artist_keys[index] for index in relevant_indices)

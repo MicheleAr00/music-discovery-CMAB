@@ -259,13 +259,48 @@ class ExperimentRunnerTests(unittest.TestCase):
         self.assertEqual(len({run.candidate_pool_digest for run in epsilon}), 1)
 
     def test_same_seed_reproduces_decisions_metrics_and_pool_digest(self):
-        first = self.make_runner().run_validation_sweep()
-        second = self.make_runner().run_validation_sweep()
+        first_runner = self.make_runner()
+        second_runner = self.make_runner()
+        first = first_runner.run_validation_sweep()
+        second = second_runner.run_validation_sweep()
         for left, right in zip(first, second):
             self.assertEqual(left.run_id, right.run_id)
-            self.assertEqual(left.simulation.decisions, right.simulation.decisions)
+            self.assertEqual(left.to_json_dict(first_runner.config)["decisions"],
+                             right.to_json_dict(second_runner.config)["decisions"])
             self.assertEqual(left.metrics, right.metrics)
             self.assertEqual(left.candidate_pool_digest, right.candidate_pool_digest)
+
+    def test_validation_sweep_spools_details_and_returns_compact_results(self):
+        runner = self.make_runner(policies=("random",), candidate_pool_depths=(50, 100))
+        runs = runner.run_validation_sweep()
+        self.assertEqual(len(runs), 2)
+        for run in runs:
+            self.assertEqual(run.simulation.decisions, ())
+            self.assertEqual(run.simulation.eligible_catalog, frozenset())
+            self.assertEqual(run.simulation.eligible_artists, frozenset())
+            details = run.to_json_dict(runner.config)
+            self.assertEqual(len(details["decisions"]), run.simulation.decision_points)
+            self.assertEqual(details["candidate_pool_digest"], run.candidate_pool_digest)
+
+    def test_bounded_sweep_details_match_in_memory_reference_runs(self):
+        runner = self.make_runner(policies=("random",), candidate_pool_depths=(50, 100))
+        reference = tuple(
+            runner._run_one("validation", policy, params, depth)
+            for depth in runner.config.candidate_pool_depths
+            for policy, params in runner._validation_policy_grid()
+        )
+        bounded = runner.run_validation_sweep()
+        self.assertEqual(len(reference), len(bounded))
+        for full, compact in zip(reference, bounded):
+            details = compact.to_json_dict(runner.config)
+            self.assertEqual(full.run_id, compact.run_id)
+            self.assertEqual(full.metrics, compact.metrics)
+            self.assertEqual(full.candidate_pool_digest, compact.candidate_pool_digest)
+            self.assertEqual(full.scaler_digest, compact.scaler_digest)
+            self.assertEqual(
+                [_decision for _decision in full.to_json_dict(runner.config)["decisions"]],
+                details["decisions"],
+            )
 
     def test_validation_results_are_ranked_by_frozen_criterion(self):
         runner = self.make_runner()

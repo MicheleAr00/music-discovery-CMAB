@@ -8,7 +8,7 @@ policy cannot silently see a different schedule or candidate union.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 import csv
 from itertools import groupby
@@ -16,6 +16,8 @@ import hashlib
 import itertools
 import json
 from pathlib import Path
+import shutil
+import tempfile
 from time import perf_counter
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
@@ -52,7 +54,7 @@ from types import MappingProxyType
 
 @dataclass(frozen=True, slots=True)
 class ExperimentRun:
-    """Metrics, provenance and decision log from one phase/policy run."""
+    """Metrics and provenance for one run; validation details may be disk-backed."""
 
     run_id: str
     configuration_hash: str
@@ -77,6 +79,8 @@ class ExperimentRun:
     created_at_utc: str
     candidate_pool_digest: str
     scaler_digest: str
+    details_path: Optional[str] = None
+    _details_owner: Any = field(default=None, repr=False, compare=False)
 
     def summary_row(self, config: ExperimentConfig) -> dict[str, Any]:
         """Flatten the per-run result into a CSV-friendly record."""
@@ -132,6 +136,11 @@ class ExperimentRun:
 
     def to_json_dict(self, config: ExperimentConfig) -> dict[str, Any]:
         """Return complete provenance and per-decision information as JSON data."""
+        if self.details_path is not None:
+            if not Path(self.details_path).is_file():
+                raise RuntimeError("spooled validation details were closed or removed")
+            with Path(self.details_path).open("r", encoding="utf-8") as stream:
+                return json.load(stream)
         decisions = [_decision_to_dict(record) for record in self.simulation.decisions]
         return {
             "summary": self.summary_row(config),
@@ -186,6 +195,27 @@ def _decision_to_dict(record: DecisionRecord) -> dict[str, Any]:
         "top_k_effective_size": record.top_k_effective_size,
         "feedback_applied_before": record.feedback_applied_before,
     }
+
+
+def _write_run_json_line(stream, run: ExperimentRun, config: ExperimentConfig) -> None:
+    """Stream one complete run record without materializing all decisions."""
+    stream.write("{\"summary\":")
+    json.dump(run.summary_row(config), stream, sort_keys=True, ensure_ascii=False)
+    stream.write(",\"eligible_users\":")
+    json.dump(sorted(run.eligible_users), stream, ensure_ascii=False)
+    stream.write(",\"eligibility_counts\":")
+    json.dump(
+        {user: dict(counts) for user, counts in run.eligibility_counts.items()},
+        stream, sort_keys=True, ensure_ascii=False,
+    )
+    stream.write(",\"candidate_pool_digest\":")
+    json.dump(run.candidate_pool_digest, stream)
+    stream.write(',"decisions":[')
+    for index, record in enumerate(run.simulation.decisions):
+        if index:
+            stream.write(",")
+        json.dump(_decision_to_dict(record), stream, sort_keys=True, ensure_ascii=False)
+    stream.write("]}\n")
 
 
 class _RecordingGenerator:
@@ -245,6 +275,10 @@ class ExperimentRunner:
             reward_calculator=self._reward_calculator,
         )
         self._final_test_completed = False
+        # Detailed validation decisions are spooled per run. Keeping the
+        # TemporaryDirectory alive on the runner preserves write_results()
+        # while allowing each heavy SimulationResult to be released at once.
+        self._validation_spools: list[tempfile.TemporaryDirectory] = []
 
     @property
     def eligible_users(self) -> frozenset[str]:
@@ -315,24 +349,61 @@ class ExperimentRunner:
         return eligible, counts, dataset_digest.hexdigest()
 
     def run_validation_sweep(self) -> tuple[ExperimentRun, ...]:
-        """Run the complete configured grid, including N sensitivity values."""
+        """Run the configured grid while retaining only compact run summaries.
+
+        Detailed per-decision JSON is spooled to disk as each run completes;
+        the returned records keep scalar counters and metrics but not the
+        candidate/context-heavy decision tuple. This bounds retained sweep
+        memory to one active simulation plus compact summaries.
+        """
         if self.config.mode != "validation_sweep":
             raise ValueError("run_validation_sweep requires mode='validation_sweep'")
         if not self.eligible_users:
             raise ValueError("no users satisfy the configured N_min eligibility rule")
         runs: list[ExperimentRun] = []
         pool_traces: dict[int, tuple[str, str]] = {}
-        for depth in self.config.candidate_pool_depths:
-            for policy_name, params in self._validation_policy_grid():
-                run = self._run_one("validation", policy_name, params, depth)
-                signatures = (run.candidate_pool_digest, run.scaler_digest)
-                previous = pool_traces.setdefault(depth, signatures)
-                if previous != signatures:
-                    raise RuntimeError(
-                        "fairness violation: policy/parameter changed candidate pools or warm-up scaler"
+        spool_root = Path(self.config.results_directory)
+        spool_root.mkdir(parents=True, exist_ok=True)
+        spool = tempfile.TemporaryDirectory(
+            prefix="music-discovery-validation-", dir=spool_root
+        )
+        try:
+            for depth in self.config.candidate_pool_depths:
+                for policy_name, params in self._validation_policy_grid():
+                    full_run = self._run_one("validation", policy_name, params, depth)
+                    signatures = (full_run.candidate_pool_digest, full_run.scaler_digest)
+                    previous = pool_traces.setdefault(depth, signatures)
+                    if previous != signatures:
+                        raise RuntimeError(
+                            "fairness violation: policy/parameter changed candidate pools or warm-up scaler"
+                        )
+                    detail_path = Path(spool.name) / f"{full_run.run_id}.jsonl"
+                    with detail_path.open("w", encoding="utf-8") as stream:
+                        _write_run_json_line(stream, full_run, self.config)
+                    compact_simulation = replace(
+                        full_run.simulation,
+                        decisions=(),
+                        eligible_catalog=frozenset(),
+                        eligible_artists=frozenset(),
                     )
-                runs.append(run)
+                    runs.append(replace(
+                        full_run,
+                        simulation=compact_simulation,
+                        details_path=str(detail_path),
+                        _details_owner=spool,
+                    ))
+                    del full_run, compact_simulation
+        except Exception:
+            spool.cleanup()
+            raise
+        self._validation_spools.append(spool)
         return tuple(runs)
+
+    def close(self) -> None:
+        """Release temporary per-run validation detail files owned by runner."""
+        for spool in self._validation_spools:
+            spool.cleanup()
+        self._validation_spools.clear()
 
     def run_final_test(self) -> tuple[ExperimentRun, ...]:
         """Run one explicitly selected, common-N parameterization per policy."""
@@ -558,6 +629,9 @@ class ExperimentRunner:
         evaluated = self._metrics_evaluator.evaluate(
             simulation, k_values=self.config.k_values
         )
+        # Break TemporalState -> listener -> CandidateGenerator -> state so
+        # the completed run's large temporal indexes are released promptly.
+        delegate.close()
         metrics = {name: summary.value for name, summary in evaluated.metrics.items()}
         parameters = dict(params)
         if policy_name in {"random", "epsilon_greedy"}:
@@ -654,5 +728,13 @@ class ExperimentRunner:
             writer.writerows(rows)
         with jsonl_path.open("w", encoding="utf-8") as stream:
             for run in runs:
-                stream.write(json.dumps(run.to_json_dict(self.config), sort_keys=True, ensure_ascii=False) + "\n")
+                if run.details_path is not None:
+                    if not Path(run.details_path).is_file():
+                        raise RuntimeError(
+                            "spooled validation details were closed or removed before writing results"
+                        )
+                    with Path(run.details_path).open("r", encoding="utf-8") as detail_stream:
+                        shutil.copyfileobj(detail_stream, stream)
+                else:
+                    _write_run_json_line(stream, run, self.config)
         return csv_path, jsonl_path

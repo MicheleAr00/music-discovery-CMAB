@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import math
 import unittest
 
-from src.data.state import PlayEvent
+from src.data.state import PlayEvent, TemporalState
 from src.simulation.reward import DEFAULT_REWARD_HORIZON, RewardCalculator
 
 
@@ -29,6 +29,15 @@ def naive_count(events, user, artist, decision_time, horizon):
         if item.user_id == user
         and item.artist_id == artist
         and decision_time < item.timestamp <= end
+    )
+
+
+def naive_future_artists(events, user, decision_time, horizon):
+    end = decision_time + horizon
+    return frozenset(
+        item.artist_id
+        for item in events
+        if item.user_id == user and decision_time < item.timestamp <= end
     )
 
 
@@ -150,6 +159,54 @@ class RewardCalculatorTest(unittest.TestCase):
                             ),
                             naive_count(events, user, artist, decision_time, horizon),
                         )
+
+    def test_future_artist_index_matches_naive_reference_at_temporal_boundaries(self):
+        horizon = timedelta(seconds=5)
+        events = [
+            event("U1", -1, "PAST"),
+            event("U1", 0, "AT_T"),
+            event("U1", 1, "A1"),
+            event("U1", 2, "A2"),
+            event("U2", 2, "OTHER_USER"),
+            event("U1", 3, "A1"),
+            event("U1", 5, "AT_END"),
+            event("U1", 6, "OUTSIDE"),
+        ]
+        calculator = RewardCalculator(events)
+        for user, at, duration in (
+            ("U1", 0, horizon),
+            ("U1", 2, timedelta(seconds=1)),
+            ("U1", 5, horizon),
+            ("U2", 0, horizon),
+            ("missing", 0, horizon),
+        ):
+            decision_time = BASE + timedelta(seconds=at)
+            self.assertEqual(
+                calculator.future_artist_keys(user, decision_time, duration),
+                naive_future_artists(events, user, decision_time, duration),
+            )
+
+    def test_future_artist_results_are_deterministic_and_index_is_evaluation_only(self):
+        events = [
+            event("U1", second, artist)
+            for second, artist in ((1, "A2"), (2, "A1"), (3, "A2"), (4, "A3"))
+        ]
+        calculator = RewardCalculator(events)
+        before = (
+            {user: tuple(times) for user, times in calculator._user_event_times.items()},
+            {user: tuple(indices) for user, indices in calculator._user_event_artist_indices.items()},
+        )
+        results = [calculator.future_artist_keys("U1", BASE) for _ in range(5)]
+        after = (
+            {user: tuple(times) for user, times in calculator._user_event_times.items()},
+            {user: tuple(indices) for user, indices in calculator._user_event_artist_indices.items()},
+        )
+        self.assertEqual(results, [frozenset({"A1", "A2", "A3"})] * 5)
+        self.assertEqual(before, after)
+        observable = TemporalState(events)
+        observable.advance_to(BASE)
+        self.assertEqual(observable.get_user_artist_count("U1", "A1"), 0)
+        self.assertEqual(calculator.future_artist_keys("U1", BASE), {"A1", "A2", "A3"})
 
     def test_non_default_horizon_and_query_override(self) -> None:
         events = [event("U1", 1), event("U1", 5)]
