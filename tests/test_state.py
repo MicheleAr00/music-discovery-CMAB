@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import unittest
 
 from src.data.state import PlayEvent, TemporalState
+from src.data.identity import resolve_artist_key, resolve_item_key
 
 
 def ts(value: str) -> datetime:
@@ -13,12 +14,14 @@ def ts(value: str) -> datetime:
 class TemporalStateSanityTest(unittest.TestCase):
     def test_s1_to_s2_keeps_current_session_event_invisible(self) -> None:
         events = [
-            PlayEvent("U1", ts("10:00:00"), "T1", "A1"),
-            PlayEvent("U1", ts("10:02:00"), "T2", "A1"),
-            PlayEvent("U1", ts("10:05:00"), "T3", "A2"),
-            PlayEvent("U1", ts("10:20:00"), "T4", "A2"),
+            PlayEvent.from_raw("U1", ts("10:00:00"), "T1", "A1"),
+            PlayEvent.from_raw("U1", ts("10:02:00"), "T2", "A1"),
+            PlayEvent.from_raw("U1", ts("10:05:00"), "T3", "A2"),
+            PlayEvent.from_raw("U1", ts("10:20:00"), "T4", "A2"),
         ]
         state = TemporalState(events)
+        item = lambda track, artist: resolve_item_key(track, resolve_artist_key(artist, None), None)
+        artist = lambda value: resolve_artist_key(value, None)
 
     # First decision point: no event at t=10:00 belongs to the prior state.
         self.assertEqual(state.advance_to(ts("10:00:00")), 0)
@@ -31,29 +34,29 @@ class TemporalStateSanityTest(unittest.TestCase):
         self.assertEqual(state.get_user_event_count("U1"), 3)
         self.assertEqual(state.get_user_distinct_track_count("U1"), 3)
         self.assertEqual(state.get_user_distinct_artist_count("U1"), 2)
-        self.assertEqual(state.get_user_track_count("U1", "T1"), 1)
-        self.assertEqual(state.get_user_track_count("U1", "T2"), 1)
-        self.assertEqual(state.get_user_track_count("U1", "T3"), 1)
-        self.assertEqual(state.get_user_artist_count("U1", "A1"), 2)
-        self.assertEqual(state.get_user_artist_count("U1", "A2"), 1)
-        self.assertEqual(state.get_track_play_count("T1"), 1)
-        self.assertEqual(state.get_track_user_count("T1"), 1)
-        self.assertEqual(state.get_artist_play_count("A1"), 2)
-        self.assertEqual(state.get_artist_user_count("A1"), 1)
-        self.assertEqual(state.get_track_first_timestamp("T3"), ts("10:05:00"))
-        self.assertTrue(state.is_track_novel("U1", "T4"))
-        self.assertTrue(state.is_artist_novel("U1", "A3"))
+        self.assertEqual(state.get_user_item_count("U1", item("T1", "A1")), 1)
+        self.assertEqual(state.get_user_item_count("U1", item("T2", "A1")), 1)
+        self.assertEqual(state.get_user_item_count("U1", item("T3", "A2")), 1)
+        self.assertEqual(state.get_user_artist_count("U1", artist("A1")), 2)
+        self.assertEqual(state.get_user_artist_count("U1", artist("A2")), 1)
+        self.assertEqual(state.get_item_play_count(item("T1", "A1")), 1)
+        self.assertEqual(state.get_item_user_count(item("T1", "A1")), 1)
+        self.assertEqual(state.get_artist_play_count(artist("A1")), 2)
+        self.assertEqual(state.get_artist_user_count(artist("A1")), 1)
+        self.assertEqual(state.get_item_first_timestamp(item("T3", "A2")), ts("10:05:00"))
+        self.assertTrue(state.is_item_novel("U1", item("T4", "A2")))
+        self.assertTrue(state.is_artist_novel("U1", artist("A3")))
         self.assertEqual(
-            state.get_user_track_recency("U1", "T1"), timedelta(minutes=20)
+            state.get_user_item_recency("U1", item("T1", "A1")), timedelta(minutes=20)
         )
-        self.assertEqual(state.get_track_age("T1"), timedelta(minutes=20))
-        self.assertEqual(state.get_track_play_count("T4"), 0)
+        self.assertEqual(state.get_item_age(item("T1", "A1")), timedelta(minutes=20))
+        self.assertEqual(state.get_item_play_count(item("T4", "A2")), 0)
 
     # T4 becomes visible only after time moves strictly past its timestamp.
         self.assertEqual(state.advance_to(ts("10:21:00")), 1)
-        self.assertEqual(state.get_user_track_count("U1", "T4"), 1)
-        self.assertEqual(state.get_track_play_count("T4"), 1)
-        self.assertFalse(state.is_artist_novel("U1", "A2"))
+        self.assertEqual(state.get_user_item_count("U1", item("T4", "A2")), 1)
+        self.assertEqual(state.get_item_play_count(item("T4", "A2")), 1)
+        self.assertFalse(state.is_artist_novel("U1", artist("A2")))
 
 # =============================================================================
 # NOTA ARCHITETTURALE E METODOLOGICA (TemporalStateSanityTest)

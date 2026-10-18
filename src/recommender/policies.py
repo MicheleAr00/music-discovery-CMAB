@@ -136,7 +136,7 @@ class GlobalPopularityPolicy:
         )
         order = sorted(
             range(len(candidates)),
-            key=lambda index: (-scores[index], candidates[index].track_key),
+            key=lambda index: (-scores[index], candidates[index].item_key),
         )
         return _make_ranking(order, scores, top_k)
 
@@ -170,8 +170,8 @@ class PersonalizedGreedyPolicy:
             range(len(candidates)),
             key=lambda index: (
                 -scores[index],
-                -state.get_track_play_count(candidates[index].track_key),
-                candidates[index].track_key,
+                -state.get_item_play_count(candidates[index].item_key),
+                candidates[index].item_key,
             ),
         )
 
@@ -263,7 +263,7 @@ class LinUCBPolicy:
             raise ValueError("one context is required for each candidate")
         scored = self._learner.score_batch(
             contexts,
-            candidate_ids=(candidate.track_key for candidate in candidates),
+            candidate_ids=(candidate.item_key for candidate in candidates),
         )
         order = sorted(scored, key=lambda row: (-row.score, row.index))[:top_k]
         selected = order[0]

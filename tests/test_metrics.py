@@ -20,7 +20,7 @@ HORIZON = timedelta(days=7)
 
 
 def event(user: str, when: datetime, artist: str, track: str = "event-track"):
-    return PlayEvent(user, when, track, artist)
+    return PlayEvent.from_raw(user, when, track, artist)
 
 
 def item(track: str, artist: str) -> Candidate:
@@ -52,7 +52,7 @@ def decision(
         decision_time=when,
         selected_candidate=selected,
         selected_artist=selected.track.artist_key if selected else None,
-        selected_track=selected.track_key if selected else None,
+        selected_item_key=selected.item_key if selected else None,
         selected_score=0.0 if selected else None,
         selected_context=(0.0,) * 15 if selected else None,
         selected_scaled_context=(0.0,) * 15 if selected else None,

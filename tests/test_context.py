@@ -5,6 +5,7 @@ import math
 import unittest
 
 from src.data.state import PlayEvent, TemporalState
+from src.data.identity import resolve_artist_key, resolve_item_key
 from src.simulation.candidate_generator import (
     Candidate,
     CandidateGenerator,
@@ -30,12 +31,12 @@ def candidate(track: str = "T1", artist: str = "A1") -> Candidate:
 
 def known_history() -> list[PlayEvent]:
     return [
-        PlayEvent("U1", ts(0), "T1", "A1"),
-        PlayEvent("U1", ts(10), "T1", "A1"),
-        PlayEvent("U1", ts(20), "T2", "A1"),
-        PlayEvent("U2", ts(30), "T1", "A1"),
-        PlayEvent("U2", ts(40), "Tnew", "A1"),
-        PlayEvent("U2", ts(50), "T3", "A2"),
+        PlayEvent.from_raw("U1", ts(0), "T1", "A1"),
+        PlayEvent.from_raw("U1", ts(10), "T1", "A1"),
+        PlayEvent.from_raw("U1", ts(20), "T2", "A1"),
+        PlayEvent.from_raw("U2", ts(30), "T1", "A1"),
+        PlayEvent.from_raw("U2", ts(40), "Tnew", "A1"),
+        PlayEvent.from_raw("U2", ts(50), "T3", "A2"),
     ]
 
 
@@ -113,9 +114,9 @@ class ContextBuilderTest(unittest.TestCase):
 
     def test_events_at_and_after_decision_do_not_leak_into_context(self) -> None:
         events = [
-            PlayEvent("U1", ts(0), "T1", "A1"),
-            PlayEvent("U1", ts(10), "T1", "A1"),  # exactly at decision
-            PlayEvent("U1", ts(20), "T2", "A2"),  # later than decision
+            PlayEvent.from_raw("U1", ts(0), "T1", "A1"),
+            PlayEvent.from_raw("U1", ts(10), "T1", "A1"),  # exactly at decision
+            PlayEvent.from_raw("U1", ts(20), "T2", "A2"),  # later than decision
         ]
         state = TemporalState(events)
         state.advance_to(ts(10))
@@ -131,9 +132,9 @@ class ContextBuilderTest(unittest.TestCase):
 
     def test_context_changes_after_state_advances_past_new_events(self) -> None:
         events = [
-            PlayEvent("U1", ts(0), "T1", "A1"),
-            PlayEvent("U1", ts(10), "T1", "A1"),
-            PlayEvent("U1", ts(20), "T2", "A2"),
+            PlayEvent.from_raw("U1", ts(0), "T1", "A1"),
+            PlayEvent.from_raw("U1", ts(10), "T1", "A1"),
+            PlayEvent.from_raw("U1", ts(20), "T2", "A2"),
         ]
         state = TemporalState(events)
         builder = ContextBuilder(state)
@@ -148,8 +149,8 @@ class ContextBuilderTest(unittest.TestCase):
         self.assertNotEqual(before, after)
 
     def test_identity_fallback_keys_match_state_queries(self) -> None:
-        track_key = "name::Fallback Artist::Fallback Track"
-        artist_key = "name::Fallback Artist"
+        track_key = resolve_item_key(None, resolve_artist_key(None, "Fallback Artist"), "Fallback Track")
+        artist_key = resolve_artist_key(None, "Fallback Artist")
         state = TemporalState(
             [PlayEvent("U2", ts(0), track_key, artist_key)]
         )
@@ -172,7 +173,7 @@ class ContextBuilderTest(unittest.TestCase):
         self.assertEqual(first, second)
 
     def test_cold_start_single_play_and_new_candidate_edges(self) -> None:
-        state = TemporalState([PlayEvent("U2", ts(0), "T1", "A1")])
+        state = TemporalState([PlayEvent.from_raw("U2", ts(0), "T1", "A1")])
         state.advance_to(ts(1))
         values = ContextBuilder(state).build("U1", candidate("T1", "A1"), ts(1))
         self.assertEqual(values[:5], (0.0, 0.0, 0.0, 0.0, 0.0))
@@ -187,7 +188,7 @@ class ContextBuilderTest(unittest.TestCase):
             ContextBuilder(state).build("U1", candidate(), ts(60))
 
     def test_rejects_candidate_not_observed_before_decision(self) -> None:
-        state = TemporalState([PlayEvent("U2", ts(10), "T1", "A1")])
+        state = TemporalState([PlayEvent.from_raw("U2", ts(10), "T1", "A1")])
         state.advance_to(ts(10))
         with self.assertRaises(ValueError):
             ContextBuilder(state).build("U1", candidate(), ts(10))
@@ -198,10 +199,10 @@ class ContextBuilderTest(unittest.TestCase):
         generator = CandidateGenerator(state)
         state.advance_to(ts(60))
         pools = generator.generate("U1", ts(60))
-        generated = next(item for item in pools.candidates if item.track_key == "T1")
+        generated = next(item for item in pools.candidates if item.item_key == candidate("T1", "A1").item_key)
         values = ContextBuilder(state).build("U1", generated, ts(60))
         self.assertEqual(len(values), 15)
-        self.assertEqual(values[5], math.log1p(state.get_track_play_count("T1")))
+        self.assertEqual(values[5], math.log1p(state.get_item_play_count(candidate("T1", "A1").item_key)))
         self.assertEqual(values[13], 0.0)
 
 

@@ -5,6 +5,7 @@ from unittest.mock import patch
 import unittest
 
 from src.data.state import PlayEvent, TemporalState
+from src.data.identity import resolve_artist_key, resolve_item_key
 from src.recommender.policies import (
     DEFAULT_EPSILONS,
     EpsilonGreedyPolicy,
@@ -28,7 +29,7 @@ CONTEXT = (0.0,) * 15
 
 
 def event(user: str, when: datetime, track: str, artist: str) -> PlayEvent:
-    return PlayEvent(user, when, track, artist)
+    return PlayEvent.from_raw(user, when, track, artist)
 
 
 def candidate(track: str, artist: str) -> Candidate:
@@ -46,7 +47,11 @@ def state_at(events: list[PlayEvent], timestamp: datetime = T):
 
 
 def candidate_keys(rows):
-    return tuple(row.track_key for row in rows)
+    return tuple(row.item_key for row in rows)
+
+
+def item_key(track: str, artist: str) -> str:
+    return resolve_item_key(track, resolve_artist_key(artist, None), None)
 
 
 def basic_policy_events() -> list[PlayEvent]:
@@ -154,7 +159,7 @@ class PopularityPolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             candidate_keys(tuple(pool[i] for i in ranked.top_k_indices)),
-            ("TA", "TA3", "TB"),
+            (item_key("TA", "A"), item_key("TA3", "A"), item_key("TB", "B")),
         )
         self.assertEqual(ranked.top_k_scores, (3.0, 3.0, 2.0))
 
@@ -186,8 +191,8 @@ class PopularityPolicyTests(unittest.TestCase):
             pool, user_id="U", timestamp=T + timedelta(microseconds=1),
             state=state, contexts=(), top_k=2,
         )
-        self.assertEqual(pool[before.selected_index].track_key, "TA")
-        self.assertEqual(pool[after.selected_index].track_key, "TB")
+        self.assertEqual(pool[before.selected_index].item_key, item_key("TA", "A"))
+        self.assertEqual(pool[after.selected_index].item_key, item_key("TB", "B"))
 
 
 class PersonalizedGreedyPolicyTests(unittest.TestCase):
@@ -204,7 +209,7 @@ class PersonalizedGreedyPolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             candidate_keys(tuple(pool[index] for index in ranked.top_k_indices)),
-            ("TA", "TB", "TC"),
+            (item_key("TA", "A"), item_key("TB", "B"), item_key("TC", "C")),
         )
         self.assertEqual(ranked.top_k_scores, (2.0, 1.0, 0.0))
 
@@ -221,8 +226,8 @@ class PersonalizedGreedyPolicyTests(unittest.TestCase):
         first = policy.rank(pool, user_id="U", timestamp=T, state=state, contexts=(), top_k=3)
         second = policy.rank(pool, user_id="U", timestamp=T, state=state, contexts=(), top_k=3)
         self.assertEqual(first, second)
-        self.assertEqual(pool[first.selected_index].track_key, "B_TRACK")
-        self.assertEqual(pool[first.top_k_indices[1]].track_key, "A_TRACK")
+        self.assertEqual(pool[first.selected_index].item_key, item_key("B_TRACK", "B"))
+        self.assertEqual(pool[first.top_k_indices[1]].item_key, item_key("Z_A", "A"))
 
     def test_future_user_play_does_not_change_greedy_ranking_at_t(self):
         prefix = [event("U", T - timedelta(minutes=1), "TA", "A")]

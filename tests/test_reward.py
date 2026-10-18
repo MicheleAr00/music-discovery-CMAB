@@ -5,6 +5,7 @@ import math
 import unittest
 
 from src.data.state import PlayEvent, TemporalState
+from src.data.identity import resolve_artist_key, resolve_item_key
 from src.simulation.reward import DEFAULT_REWARD_HORIZON, RewardCalculator
 
 
@@ -17,7 +18,7 @@ def event(
     artist: str = "A1",
     track: str = "T1",
 ) -> PlayEvent:
-    return PlayEvent(user, BASE + timedelta(seconds=seconds), track, artist)
+    return PlayEvent.from_raw(user, BASE + timedelta(seconds=seconds), track, artist)
 
 
 def naive_count(events, user, artist, decision_time, horizon):
@@ -27,7 +28,7 @@ def naive_count(events, user, artist, decision_time, horizon):
         1
         for item in events
         if item.user_id == user
-        and item.artist_id == artist
+        and item.artist_key == resolve_artist_key(artist, None)
         and decision_time < item.timestamp <= end
     )
 
@@ -35,7 +36,7 @@ def naive_count(events, user, artist, decision_time, horizon):
 def naive_future_artists(events, user, decision_time, horizon):
     end = decision_time + horizon
     return frozenset(
-        item.artist_id
+        item.artist_key
         for item in events
         if item.user_id == user and decision_time < item.timestamp <= end
     )
@@ -61,8 +62,8 @@ class RewardCalculatorTest(unittest.TestCase):
     def test_lower_boundary_is_excluded_and_upper_boundary_included(self) -> None:
         horizon = DEFAULT_REWARD_HORIZON
         events = [
-            PlayEvent("U1", BASE, "T_AT_T", "A1"),
-            PlayEvent("U1", BASE + timedelta(days=7), "T_AT_END", "A1"),
+            PlayEvent.from_raw("U1", BASE, "T_AT_T", "A1"),
+            PlayEvent.from_raw("U1", BASE + timedelta(days=7), "T_AT_END", "A1"),
         ]
         calculator = RewardCalculator(events)
         self.assertEqual(calculator.future_count("U1", "A1", BASE, horizon), 1)
@@ -70,7 +71,7 @@ class RewardCalculatorTest(unittest.TestCase):
 
     def test_event_just_outside_horizon_is_excluded(self) -> None:
         events = [
-            PlayEvent(
+            PlayEvent.from_raw(
                 "U1",
                 BASE + timedelta(days=7, microseconds=1),
                 "T1",
@@ -201,12 +202,12 @@ class RewardCalculatorTest(unittest.TestCase):
             {user: tuple(times) for user, times in calculator._user_event_times.items()},
             {user: tuple(indices) for user, indices in calculator._user_event_artist_indices.items()},
         )
-        self.assertEqual(results, [frozenset({"A1", "A2", "A3"})] * 5)
+        self.assertEqual(results, [frozenset(resolve_artist_key(name, None) for name in ("A1", "A2", "A3"))] * 5)
         self.assertEqual(before, after)
         observable = TemporalState(events)
         observable.advance_to(BASE)
-        self.assertEqual(observable.get_user_artist_count("U1", "A1"), 0)
-        self.assertEqual(calculator.future_artist_keys("U1", BASE), {"A1", "A2", "A3"})
+        self.assertEqual(observable.get_user_artist_count("U1", resolve_artist_key("A1", None)), 0)
+        self.assertEqual(calculator.future_artist_keys("U1", BASE), frozenset(resolve_artist_key(name, None) for name in ("A1", "A2", "A3")))
 
     def test_non_default_horizon_and_query_override(self) -> None:
         events = [event("U1", 1), event("U1", 5)]
@@ -226,8 +227,9 @@ class RewardCalculatorTest(unittest.TestCase):
             calculator.future_count("U1", "A1", BASE, timedelta(0))
 
     def test_identity_fallback_uses_shared_artist_key_convention(self) -> None:
-        fallback_artist_key = "name::Fallback Artist"
-        events = [event("U1", 1, fallback_artist_key)]
+        fallback_artist_key = resolve_artist_key(None, "Fallback Artist")
+        fallback_item_key = resolve_item_key(None, fallback_artist_key, "Fallback Track")
+        events = [PlayEvent("U1", BASE + timedelta(seconds=1), fallback_item_key, fallback_artist_key)]
         calculator = RewardCalculator(events)
         self.assertEqual(
             calculator.future_count(
@@ -257,7 +259,7 @@ class RewardCalculatorTest(unittest.TestCase):
             RewardCalculator([object()])
         with self.assertRaisesRegex(ValueError, "ordered"):
             RewardCalculator([event("U1", 2), event("U1", 1)])
-        aware_event = PlayEvent(
+        aware_event = PlayEvent.from_raw(
             "U1", BASE.replace(tzinfo=timezone.utc), "T1", "A1"
         )
         with self.assertRaisesRegex(ValueError, "consistent timezone"):
@@ -265,7 +267,7 @@ class RewardCalculatorTest(unittest.TestCase):
 
     def test_decision_time_must_match_index_timezone_convention(self) -> None:
         event_time = BASE.replace(tzinfo=timezone.utc)
-        calculator = RewardCalculator([PlayEvent("U1", event_time, "T1", "A1")])
+        calculator = RewardCalculator([PlayEvent.from_raw("U1", event_time, "T1", "A1")])
         with self.assertRaisesRegex(ValueError, "same timezone convention"):
             calculator.future_count("U1", "A1", BASE)
 

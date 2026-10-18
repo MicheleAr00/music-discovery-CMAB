@@ -7,6 +7,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from src.data.state import PlayEvent, TemporalState
+from src.data.identity import resolve_artist_key, resolve_item_key
 from src.simulation.candidate_generator import CandidateGenerator, CandidatePools
 from src.simulation.context import ContextBuilder
 from src.simulation.linucb import LinUCB
@@ -25,7 +26,7 @@ HORIZON = timedelta(days=7)
 
 
 def event(user: str, when: datetime, track: str, artist: str = "A1") -> PlayEvent:
-    return PlayEvent(user, when, track, artist)
+    return PlayEvent.from_raw(user, when, track, artist)
 
 
 def make_events() -> list[PlayEvent]:
@@ -118,8 +119,8 @@ class SequentialSimulatorTest(unittest.TestCase):
         starts = tuple(
             iter_session_starts(
                 [
-                    PlayEvent("U1", before_jump, "T1", "A1"),
-                    PlayEvent("U1", after_jump, "T2", "A1"),
+                    PlayEvent.from_raw("U1", before_jump, "T1", "A1"),
+                    PlayEvent.from_raw("U1", after_jump, "T2", "A1"),
                 ]
             )
         )
@@ -166,8 +167,8 @@ class SequentialSimulatorTest(unittest.TestCase):
         at_day_seven = result.decisions[2]
         self.assertNotIn("V0", {item.track_key for item in at_start.top_k_candidates})
         self.assertNotIn("V4", {item.track_key for item in at_day_seven.top_k_candidates})
-        self.assertGreaterEqual(simulator.state.get_user_track_count("U1", "V0"), 1)
-        self.assertGreaterEqual(simulator.state.get_user_track_count("U1", "V4"), 1)
+        self.assertGreaterEqual(simulator.state.get_user_item_count("U1", resolve_item_key("V0", resolve_artist_key("A1", None), None)), 1)
+        self.assertGreaterEqual(simulator.state.get_user_item_count("U1", resolve_item_key("V4", resolve_artist_key("A1", None), None)), 1)
 
     def test_simultaneous_users_share_the_same_strictly_prior_state(self) -> None:
         simulator = build_simulator(eligible_users={"U1", "U2"})

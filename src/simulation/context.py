@@ -66,9 +66,9 @@ class ContextBuilder:
                 "TemporalState must be advanced to the exact context timestamp"
             )
 
-        track_key = candidate.track.track_key
+        item_key = candidate.item_key
         artist_key = candidate.track.artist_key
-        first_track_time = self._state.get_track_first_timestamp(track_key)
+        first_track_time = self._state.get_item_first_timestamp(item_key)
         if first_track_time is None or first_track_time >= timestamp:
             raise ValueError(
                 "candidate track must have been observed strictly before timestamp"
@@ -77,12 +77,12 @@ class ContextBuilder:
         event_count = self._state.get_user_event_count(user_id)
         distinct_artist_count = self._state.get_user_distinct_artist_count(user_id)
         distinct_track_count = self._state.get_user_distinct_track_count(user_id)
-        track_count = self._state.get_user_track_count(user_id, track_key)
+        track_count = self._state.get_user_item_count(user_id, item_key)
         artist_count = self._state.get_user_artist_count(user_id, artist_key)
 
-        age = self._state.get_track_age(track_key, timestamp)
+        age = self._state.get_item_age(item_key, timestamp)
         assert age is not None  # first_track_time above proves this exists.
-        recency = self._state.get_user_track_recency(user_id, track_key, timestamp)
+        recency = self._state.get_user_item_recency(user_id, item_key, timestamp)
 
         artist_repetition = (
             1.0 - distinct_artist_count / event_count if event_count else 0.0
@@ -102,8 +102,8 @@ class ContextBuilder:
             math.log1p(distinct_track_count),
             artist_repetition,
             track_repetition,
-            math.log1p(self._state.get_track_play_count(track_key)),
-            math.log1p(self._state.get_track_user_count(track_key)),
+            math.log1p(self._state.get_item_play_count(item_key)),
+            math.log1p(self._state.get_item_user_count(item_key)),
             math.log1p(self._state.get_artist_play_count(artist_key)),
             math.log1p(self._state.get_artist_user_count(artist_key)),
             math.log1p(_seconds(age)),

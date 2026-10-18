@@ -13,8 +13,8 @@ from datetime import datetime, timedelta, timezone
 import math
 from typing import Iterable, Optional
 
+from src.data.identity import is_canonical_artist_key, resolve_artist_key
 from src.data.state import PlayEvent
-from src.simulation.candidate_generator import resolve_identity_key
 
 
 DEFAULT_REWARD_HORIZON = timedelta(days=7)
@@ -95,16 +95,16 @@ class RewardCalculator:
                 raise ValueError("future reward events must be ordered by timestamp")
             self._last_event_time = event_time
 
-            key = (event.user_id, event.artist_id)
+            key = (event.user_id, event.artist_key)
             times = self._timestamps.get(key)
             if times is None:
                 times = array("q")
                 self._timestamps[key] = times
-            artist_index = self._artist_indices.get(event.artist_id)
+            artist_index = self._artist_indices.get(event.artist_key)
             if artist_index is None:
                 artist_index = len(self._artist_keys)
-                self._artist_indices[event.artist_id] = artist_index
-                self._artist_keys.append(event.artist_id)
+                self._artist_indices[event.artist_key] = artist_index
+                self._artist_keys.append(event.artist_key)
             times.append(event_time)
             self._user_event_times.setdefault(event.user_id, array("q")).append(event_time)
             self._user_event_artist_indices.setdefault(event.user_id, array("I")).append(artist_index)
@@ -115,8 +115,8 @@ class RewardCalculator:
             raise TypeError("events must contain PlayEvent instances")
         if not isinstance(event.user_id, str) or not event.user_id.strip():
             raise ValueError("each event must have a nonblank user_id")
-        if not isinstance(event.artist_id, str) or not event.artist_id.strip():
-            raise ValueError("each event must have a nonblank resolved artist_id")
+        if not isinstance(event.artist_key, str) or not event.artist_key.strip():
+            raise ValueError("each event must have a nonblank resolved artist_key")
         if not isinstance(event.timestamp, datetime):
             raise ValueError("each event must have a datetime timestamp")
 
@@ -132,7 +132,7 @@ class RewardCalculator:
             raise ValueError("user_id must be a nonblank string")
         if not isinstance(decision_time, datetime):
             raise ValueError("decision_time must be a datetime")
-        artist_key = resolve_identity_key(artist_id, artist_name)
+        artist_key = resolve_artist_key(artist_id, artist_name)
         selected_horizon = horizon if horizon is not None else self._default_horizon
         horizon_us = _horizon_microseconds(selected_horizon)
 
@@ -185,6 +185,32 @@ class RewardCalculator:
             horizon,
             artist_name=artist_name,
         )
+        return math.log1p(count)
+
+    def reward_for_artist_key(
+        self,
+        user_id: str,
+        artist_key: str,
+        decision_time: datetime,
+        horizon: Optional[timedelta] = None,
+    ) -> float:
+        """Return reward for a canonical artist key already carried by an item."""
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("user_id must be a nonblank string")
+        if not isinstance(artist_key, str) or not is_canonical_artist_key(artist_key):
+            raise ValueError("artist_key must be a canonical artist key")
+        if not isinstance(decision_time, datetime):
+            raise ValueError("decision_time must be a datetime")
+        selected_horizon = horizon if horizon is not None else self._default_horizon
+        horizon_us = _horizon_microseconds(selected_horizon)
+        aware = _is_aware(decision_time)
+        if self._timezone_aware is not None and aware != self._timezone_aware:
+            raise ValueError("decision_time must use the same timezone convention as indexed events")
+        times = self._timestamps.get((user_id, artist_key))
+        if times is None:
+            return 0.0
+        start = _to_epoch_microseconds(decision_time)
+        count = bisect_right(times, start + horizon_us) - bisect_right(times, start)
         return math.log1p(count)
 
     def future_artist_keys(

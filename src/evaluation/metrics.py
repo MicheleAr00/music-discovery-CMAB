@@ -285,7 +285,7 @@ class OfflineMetricsEvaluator:
                 add(f"artist_ild{suffix}", decision.user_id, ild)
 
                 eligible_recommendation_keys[k].update(
-                    candidate.track_key for candidate in candidates
+                    candidate.item_key for candidate in candidates
                 )
                 eligible_recommendation_artists[k].update(ranked_artists)
 

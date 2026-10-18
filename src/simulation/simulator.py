@@ -80,7 +80,7 @@ class DecisionRecord:
     decision_time: datetime
     selected_candidate: Optional[Candidate]
     selected_artist: Optional[str]
-    selected_track: Optional[str]
+    selected_item_key: Optional[str]
     selected_score: Optional[float]
     selected_context: Optional[ContextVector]
     selected_scaled_context: Optional[ContextVector]
@@ -95,6 +95,11 @@ class DecisionRecord:
     feedback_applied_before: int
     top_k_track_novelty: tuple[bool, ...] = ()
     top_k_artist_novelty: tuple[bool, ...] = ()
+
+    @property
+    def selected_track(self) -> Optional[str]:
+        """Compatibility alias; the stored value is a canonical item_key."""
+        return self.selected_item_key
 
 
 @dataclass(frozen=True, slots=True)
@@ -464,7 +469,7 @@ class SequentialOfflineBanditSimulator:
                 pools, raw_contexts = self._contexts_for_user(
                     session.user_id, timestamp
                 )
-                eligible_catalog.update(candidate.track_key for candidate in pools.candidates)
+                eligible_catalog.update(candidate.item_key for candidate in pools.candidates)
                 eligible_artists.update(
                     candidate.track.artist_key for candidate in pools.candidates
                 )
@@ -476,7 +481,7 @@ class SequentialOfflineBanditSimulator:
                             decision_time=timestamp,
                             selected_candidate=None,
                             selected_artist=None,
-                            selected_track=None,
+                            selected_item_key=None,
                             selected_score=None,
                             selected_context=None,
                             selected_scaled_context=None,
@@ -520,7 +525,7 @@ class SequentialOfflineBanditSimulator:
                 selected = pools.candidates[ranking.selected_index]
                 selected_raw_context = raw_contexts[ranking.selected_index]
                 selected_scaled_context = scaled_contexts[ranking.selected_index]
-                reward = self._reward_calculator.reward(
+                reward = self._reward_calculator.reward_for_artist_key(
                     session.user_id,
                     selected.track.artist_key,
                     timestamp,
@@ -537,7 +542,7 @@ class SequentialOfflineBanditSimulator:
                         decision_time=timestamp,
                         selected_candidate=selected,
                         selected_artist=selected.track.artist_key,
-                        selected_track=selected.track_key,
+                        selected_item_key=selected.item_key,
                         selected_score=ranking.top_k_scores[0],
                         selected_context=selected_raw_context,
                         selected_scaled_context=selected_scaled_context,

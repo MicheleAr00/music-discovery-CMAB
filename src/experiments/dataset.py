@@ -17,10 +17,7 @@ import tempfile
 from typing import Iterator, Sequence, overload
 
 from src.data.state import PlayEvent
-from src.simulation.candidate_generator import (
-    resolve_identity_key,
-    resolve_track_identity_key,
-)
+from src.data.identity import resolve_event_identity_keys
 
 
 _EPOCH = datetime(1970, 1, 1)
@@ -56,14 +53,14 @@ class SQLiteEventSequence(Sequence[PlayEvent]):
         connection = sqlite3.connect(self._database_path)
         try:
             cursor = connection.execute(
-                "SELECT user_id, timestamp_us, track_key, artist_key "
+                "SELECT user_id, timestamp_us, item_key, artist_key "
                 "FROM events ORDER BY timestamp_us, ordinal"
             )
-            for user_id, timestamp_us, track_key, artist_key in cursor:
+            for user_id, timestamp_us, item_key, artist_key in cursor:
                 yield PlayEvent(
                     str(user_id),
                     _EPOCH + timedelta(microseconds=int(timestamp_us)),
-                    str(track_key),
+                    str(item_key),
                     str(artist_key),
                 )
         finally:
@@ -84,7 +81,7 @@ class SQLiteEventSequence(Sequence[PlayEvent]):
             limit = max(0, stop - start)
             with closing(sqlite3.connect(self._database_path)) as connection:
                 rows = connection.execute(
-                    "SELECT user_id, timestamp_us, track_key, artist_key FROM events "
+                    "SELECT user_id, timestamp_us, item_key, artist_key FROM events "
                     "ORDER BY timestamp_us, ordinal LIMIT ? OFFSET ?",
                     (limit, start),
                 ).fetchall()
@@ -95,7 +92,7 @@ class SQLiteEventSequence(Sequence[PlayEvent]):
             raise IndexError("event sequence index out of range")
         with closing(sqlite3.connect(self._database_path)) as connection:
             row = connection.execute(
-                "SELECT user_id, timestamp_us, track_key, artist_key FROM events "
+                "SELECT user_id, timestamp_us, item_key, artist_key FROM events "
                 "ORDER BY timestamp_us, ordinal LIMIT 1 OFFSET ?",
                 (normalized,),
             ).fetchone()
@@ -104,11 +101,11 @@ class SQLiteEventSequence(Sequence[PlayEvent]):
 
     @staticmethod
     def _event(row: tuple[object, ...]) -> PlayEvent:
-        user_id, timestamp_us, track_key, artist_key = row
+        user_id, timestamp_us, item_key, artist_key = row
         return PlayEvent(
             str(user_id),
             _EPOCH + timedelta(microseconds=int(timestamp_us)),
-            str(track_key),
+            str(item_key),
             str(artist_key),
         )
 
@@ -145,8 +142,12 @@ def load_lastfm_tsv(
 
     The source has no header and columns are user, timestamp, artist ID,
     artist name, track ID, and track name. Missing IDs use the canonical
-    identity fallback already shared by temporal state and candidate
-    generation. Timestamps are normalized to naive UTC, matching the
+    identity rules shared by temporal state and candidate generation. Track
+    IDs are paired with artist keys; missing track IDs fall back to artist key
+    plus exact title. This intentionally replaces the former
+    ``name::<artist_name>::<track_name>`` fallback, which failed to use an
+    available artist ID and could collide when names/titles contained ``::``.
+    Timestamps are normalized to naive UTC, matching the
     simulator's frozen date bounds.
     """
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
@@ -154,9 +155,12 @@ def load_lastfm_tsv(
     source = Path(path)
     if not source.is_file():
         raise FileNotFoundError(source)
+    temp_parent = Path(temporary_directory) if temporary_directory is not None else None
+    if temp_parent is not None:
+        temp_parent.mkdir(parents=True, exist_ok=True)
     temp = tempfile.TemporaryDirectory(
         prefix="music_discovery_events_",
-        dir=str(temporary_directory) if temporary_directory is not None else None,
+        dir=str(temp_parent) if temp_parent is not None else None,
     )
     database_path = Path(temp.name) / "chronological-events.sqlite3"
     try:
@@ -166,12 +170,14 @@ def load_lastfm_tsv(
             connection.execute(
                 "CREATE TABLE events ("
                 "ordinal INTEGER PRIMARY KEY, timestamp_us INTEGER NOT NULL, "
-                "user_id TEXT NOT NULL, track_key TEXT NOT NULL, artist_key TEXT NOT NULL)"
+                "user_id TEXT NOT NULL, item_key TEXT NOT NULL, artist_key TEXT NOT NULL)"
             )
             connection.execute("BEGIN")
             batch: list[tuple[int, int, str, str, str]] = []
             with source.open("r", encoding="utf-8", errors="replace", newline="") as stream:
-                reader = csv.reader(stream, delimiter="\t")
+                # This source is tab-separated, not CSV: quotes in artist and
+                # track names are literal text and must never join TSV lines.
+                reader = csv.reader(stream, delimiter="\t", quoting=csv.QUOTE_NONE)
                 for ordinal, row in enumerate(reader):
                     if len(row) != 6:
                         raise ValueError(f"TSV row {ordinal + 1} has {len(row)} columns; expected 6")
@@ -180,11 +186,13 @@ def load_lastfm_tsv(
                     if not user_id:
                         raise ValueError(f"TSV row {ordinal + 1} has a blank user ID")
                     timestamp_us = _microseconds(_parse_timestamp(timestamp_text))
-                    artist_key = resolve_identity_key(artist_id or None, artist_name or None)
-                    track_key = resolve_track_identity_key(
-                        track_id or None, artist_name or None, track_name or None
+                    item_key, artist_key = resolve_event_identity_keys(
+                        artist_id or None,
+                        artist_name or None,
+                        track_id or None,
+                        track_name or None,
                     )
-                    batch.append((ordinal, timestamp_us, user_id, track_key, artist_key))
+                    batch.append((ordinal, timestamp_us, user_id, item_key, artist_key))
                     if len(batch) >= batch_size:
                         connection.executemany("INSERT INTO events VALUES (?, ?, ?, ?, ?)", batch)
                         batch.clear()

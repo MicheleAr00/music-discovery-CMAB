@@ -6,9 +6,11 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from src.data.state import PlayEvent
+from src.data.identity import resolve_artist_key, resolve_event_identity_keys
+from src.experiments.cli import _workspace_cache_directory
 from src.experiments.config import ExperimentConfig, TemporalProtocol
 from src.experiments.dataset import load_lastfm_tsv
 from src.experiments.runner import ExperimentRunner
@@ -21,20 +23,20 @@ def tiny_events() -> list[PlayEvent]:
     validation = datetime(2020, 1, 10, 10)
     test = datetime(2020, 1, 20, 10)
     return sorted([
-        PlayEvent("U1", warm, "T1", "A1"),
-        PlayEvent("U1", warm + timedelta(minutes=20), "T2", "A2"),
-        PlayEvent("U1", warm + timedelta(minutes=40), "T1", "A1"),
-        PlayEvent("U2", warm, "T3", "A3"),
-        PlayEvent("U2", warm + timedelta(minutes=20), "T4", "A4"),
-        PlayEvent("U2", warm + timedelta(minutes=40), "T3", "A3"),
-        PlayEvent("U1", validation, "V1", "A1"),
-        PlayEvent("U2", validation, "V2", "A3"),
-        PlayEvent("U1", validation + timedelta(hours=12), "T2", "A2"),
-        PlayEvent("U2", validation + timedelta(hours=12), "T4", "A4"),
-        PlayEvent("U1", test, "X1", "A1"),
-        PlayEvent("U2", test, "X2", "A3"),
-        PlayEvent("U1", test + timedelta(hours=12), "T2", "A2"),
-        PlayEvent("U2", test + timedelta(hours=12), "T4", "A4"),
+        PlayEvent.from_raw("U1", warm, "T1", "A1"),
+        PlayEvent.from_raw("U1", warm + timedelta(minutes=20), "T2", "A2"),
+        PlayEvent.from_raw("U1", warm + timedelta(minutes=40), "T1", "A1"),
+        PlayEvent.from_raw("U2", warm, "T3", "A3"),
+        PlayEvent.from_raw("U2", warm + timedelta(minutes=20), "T4", "A4"),
+        PlayEvent.from_raw("U2", warm + timedelta(minutes=40), "T3", "A3"),
+        PlayEvent.from_raw("U1", validation, "V1", "A1"),
+        PlayEvent.from_raw("U2", validation, "V2", "A3"),
+        PlayEvent.from_raw("U1", validation + timedelta(hours=12), "T2", "A2"),
+        PlayEvent.from_raw("U2", validation + timedelta(hours=12), "T4", "A4"),
+        PlayEvent.from_raw("U1", test, "X1", "A1"),
+        PlayEvent.from_raw("U2", test, "X2", "A3"),
+        PlayEvent.from_raw("U1", test + timedelta(hours=12), "T2", "A2"),
+        PlayEvent.from_raw("U2", test + timedelta(hours=12), "T4", "A4"),
     ], key=lambda row: row.timestamp)
 
 
@@ -75,17 +77,17 @@ def eligibility_fixture():
     validation = datetime(2020, 1, 10)
     test = datetime(2020, 2, 1)
     events = [
-        PlayEvent("U", warm + timedelta(minutes=index), "T0", "A0")
+        PlayEvent.from_raw("U", warm + timedelta(minutes=index), "T0", "A0")
         for index in range(10)
     ]
     validation_points = tuple(validation + timedelta(hours=12 * index) for index in range(10))
     test_points = tuple(test + timedelta(hours=12 * index) for index in range(10))
-    events.extend(PlayEvent("U", timestamp, "T0", "A0") for timestamp in validation_points)
-    events.extend(PlayEvent("U", timestamp, "T0", "A0") for timestamp in test_points)
+    events.extend(PlayEvent.from_raw("U", timestamp, "T0", "A0") for timestamp in validation_points)
+    events.extend(PlayEvent.from_raw("U", timestamp, "T0", "A0") for timestamp in test_points)
     # These starts are inside each phase but too close to phase_end for a
     # complete seven-day reward window.
-    events.append(PlayEvent("U", datetime(2020, 1, 19), "T0", "A0"))
-    events.append(PlayEvent("U", datetime(2020, 2, 14), "T0", "A0"))
+    events.append(PlayEvent.from_raw("U", datetime(2020, 1, 19), "T0", "A0"))
+    events.append(PlayEvent.from_raw("U", datetime(2020, 2, 14), "T0", "A0"))
     protocol = TemporalProtocol(
         warmup_start=date(2020, 1, 1),
         warmup_end=date(2020, 1, 2),
@@ -433,6 +435,49 @@ class ValidationSelectionTests(unittest.TestCase):
 
 
 class DatasetLoaderTests(unittest.TestCase):
+    def test_workspace_cache_directory_is_created_under_ignored_temp_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            cache_root = _workspace_cache_directory(project_root)
+            self.assertEqual(
+                cache_root,
+                project_root / ".pytest-tmp" / "lastfm-sqlite-cache",
+            )
+            self.assertTrue(cache_root.is_dir())
+
+    def test_loader_creates_cache_parent_and_removes_sqlite_files_on_close(self):
+        content = "u1\t2020-01-01T00:00:00Z\ta1\tArtist\tt1\tTrack\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "plays.tsv"
+            cache_root = root / ".pytest-tmp" / "lastfm-sqlite-cache"
+            source.write_text(content, encoding="utf-8")
+
+            events = load_lastfm_tsv(source, temporary_directory=cache_root)
+            database_path = events.database_path
+            self.assertTrue(cache_root.is_dir())
+            self.assertTrue(database_path.is_file())
+            self.assertEqual(len(events), 1)
+            self.assertEqual(len(tuple(events)), 1)
+            events.close()
+
+            self.assertFalse(database_path.exists())
+            self.assertEqual(tuple(cache_root.iterdir()), ())
+
+    def test_loader_cleans_cache_after_parse_failure(self):
+        content = "u1\t2020-01-01T00:00:00Z\ta1\tArtist\tt1\tTrack\textra\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "malformed.tsv"
+            cache_root = root / ".pytest-tmp" / "lastfm-sqlite-cache"
+            source.write_text(content, encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "expected 6"):
+                load_lastfm_tsv(source, temporary_directory=cache_root)
+
+            self.assertTrue(cache_root.is_dir())
+            self.assertEqual(tuple(cache_root.iterdir()), ())
+
     def test_loads_reverse_ordered_tsv_as_chronological_identity_keys(self):
         content = (
             "u1\t2020-01-02T00:00:00Z\ta2\tArtist Two\tt2\tTrack Two\n"
@@ -445,12 +490,120 @@ class DatasetLoaderTests(unittest.TestCase):
             try:
                 self.assertEqual(len(events), 2)
                 self.assertEqual(events[0].timestamp, datetime(2020, 1, 1))
-                self.assertEqual(events[0].artist_id, "name::Fallback Artist")
-                self.assertEqual(events[0].track_id, "name::Fallback Artist::Track One")
-                self.assertEqual(events[1].track_id, "t2")
+                fallback_item, fallback_artist = resolve_event_identity_keys(None, "Fallback Artist", None, "Track One")
+                self.assertEqual(events[0].artist_key, fallback_artist)
+                self.assertEqual(events[0].item_key, fallback_item)
+                self.assertEqual(events[1].item_key, resolve_event_identity_keys("a2", "Artist Two", "t2", "Track Two")[0])
             finally:
                 events.close()
             self.assertFalse(events.database_path.exists())
+
+    def test_double_quotes_are_literal_in_artist_and_track_names(self):
+        content = (
+            'u1\t2020-01-02T00:00:00Z\ta1\tArtist "Quoted" Name\tt1\t"’Z\n'
+            'u2\t2020-01-01T00:00:00Z\ta2\tNext Artist\tt2\tNext Track\n'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "plays.tsv"
+            source.write_text(content, encoding="utf-8")
+            events = load_lastfm_tsv(source, temporary_directory=directory)
+            try:
+                self.assertEqual(len(events), 2)
+                # The second physical row remains its own event; quotes do not
+                # put the TSV reader into a multiline CSV quoting state.
+                self.assertEqual(events[0].user_id, "u2")
+                self.assertEqual(events[1].user_id, "u1")
+                expected_item, expected_artist = resolve_event_identity_keys("a1", 'Artist "Quoted" Name', "t1", '"’Z')
+                self.assertEqual(events[1].artist_key, expected_artist)
+                self.assertEqual(events[1].item_key, expected_item)
+            finally:
+                events.close()
+
+    def test_empty_ids_remain_empty_inputs_to_identity_fallback(self):
+        content = "u1\t2020-01-01T00:00:00Z\t\tArtist Name\t\tTrack Name\n"
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "plays.tsv"
+            source.write_text(content, encoding="utf-8")
+            events = load_lastfm_tsv(source, temporary_directory=directory)
+            try:
+                self.assertEqual(len(events), 1)
+                expected_item, expected_artist = resolve_event_identity_keys(None, "Artist Name", None, "Track Name")
+                self.assertEqual(events[0].artist_key, expected_artist)
+                self.assertEqual(events[0].item_key, expected_item)
+            finally:
+                events.close()
+
+    def test_missing_track_id_fallback_uses_artist_id_without_artist_name(self):
+        content = "u1\t2020-01-01T00:00:00Z\ta1\t\t\tTrack Name\n"
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "plays.tsv"
+            source.write_text(content, encoding="utf-8")
+            events = load_lastfm_tsv(source, temporary_directory=directory)
+            try:
+                expected_item, expected_artist = resolve_event_identity_keys(
+                    "a1", None, None, "Track Name"
+                )
+                self.assertEqual(events[0].artist_key, expected_artist)
+                self.assertEqual(events[0].item_key, expected_item)
+            finally:
+                events.close()
+
+    def test_rejects_physical_row_with_wrong_tab_delimited_column_count(self):
+        content = (
+            "u1\t2020-01-01T00:00:00Z\ta1\tArtist\tt1\tTrack\n"
+            "u2\t2020-01-02T00:00:00Z\ta2\tArtist\tt2\tTrack\textra\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "plays.tsv"
+            source.write_text(content, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, r"TSV row 2 has 7 columns; expected 6"):
+                load_lastfm_tsv(source, temporary_directory=directory)
+
+
+class ExperimentCliCleanupTests(unittest.TestCase):
+    def _run_cli_with_mocks(self, runner, events):
+        config = validation_config()
+        with (
+            patch("sys.argv", ["music-discovery", "experiments/config.json"]),
+            patch("src.experiments.cli.ExperimentConfig.from_json", return_value=config),
+            patch("src.experiments.cli._workspace_cache_directory"),
+            patch("src.experiments.cli.load_lastfm_tsv", return_value=events),
+            patch("src.experiments.cli.ExperimentRunner", return_value=runner),
+        ):
+            from src.experiments.cli import main
+
+            main()
+
+    def test_runner_close_error_still_closes_events_and_propagates_runner_error(self):
+        runner = MagicMock()
+        runner.run_validation_sweep.return_value = ()
+        runner.eligible_users = ()
+        runner.write_results.return_value = (Path("runs.csv"), Path("runs.jsonl"))
+        runner.close.side_effect = RuntimeError("runner close failed")
+        events = MagicMock()
+
+        with self.assertRaisesRegex(RuntimeError, "runner close failed"):
+            self._run_cli_with_mocks(runner, events)
+
+        runner.close.assert_called_once_with()
+        events.close.assert_called_once_with()
+
+    def test_operation_error_remains_primary_when_runner_close_also_fails(self):
+        runner = MagicMock()
+        runner.run_validation_sweep.side_effect = ValueError("simulation failed")
+        runner.close.side_effect = RuntimeError("runner close failed")
+        events = MagicMock()
+        events.close.side_effect = OSError("events close failed")
+
+        with self.assertRaisesRegex(ValueError, "simulation failed") as raised:
+            self._run_cli_with_mocks(runner, events)
+
+        runner.close.assert_called_once_with()
+        events.close.assert_called_once_with()
+        cleanup_error = raised.exception.__cause__
+        self.assertEqual(len(cleanup_error.errors), 2)
+        self.assertRegex(str(cleanup_error.errors[0]), "runner close failed")
+        self.assertRegex(str(cleanup_error.errors[1]), "events close failed")
 
 
 if __name__ == "__main__":

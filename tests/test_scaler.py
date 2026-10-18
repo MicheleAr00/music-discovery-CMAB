@@ -134,8 +134,8 @@ class FeatureScalerTest(unittest.TestCase):
     def test_context_builder_candidate_generator_scaler_integration(self) -> None:
         base = datetime(2005, 10, 30, 10, 0)
         events = [
-            PlayEvent("U1", base, "T1", "A1"),
-            PlayEvent("U2", base + timedelta(seconds=1), "T2", "A2"),
+            PlayEvent.from_raw("U1", base, "T1", "A1"),
+            PlayEvent.from_raw("U2", base + timedelta(seconds=1), "T2", "A2"),
         ]
         state = TemporalState(events)
         generator = CandidateGenerator(state)

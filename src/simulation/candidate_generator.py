@@ -13,6 +13,12 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
+from src.data.identity import (
+    is_canonical_artist_key,
+    is_canonical_item_key,
+    resolve_artist_key,
+    resolve_item_key,
+)
 from src.data.state import PlayEvent, TemporalState
 
 
@@ -20,60 +26,69 @@ SUPPORTED_POOL_DEPTHS = frozenset({50, 100, 200})
 
 
 def resolve_identity_key(identifier: Optional[str], name: Optional[str]) -> str:
-    """Return an ID key or the established ``name::...`` fallback.
-
-    Names are kept as supplied (including case); whitespace-only values count
-    as missing. This applies no additional normalization or merging rule.
-    """
-    if identifier is not None and identifier.strip():
-        return identifier
-    if name is not None and name.strip():
-        return f"name::{name}"
-    raise ValueError("an entity requires a nonblank ID or name")
+    """Backward-compatible alias for the shared canonical artist resolver."""
+    return resolve_artist_key(identifier, name)
 
 
 def resolve_track_identity_key(
-    identifier: Optional[str], artist_name: Optional[str], track_name: Optional[str]
+    identifier: Optional[str],
+    artist_name: Optional[str],
+    track_name: Optional[str],
+    artist_id: Optional[str] = None,
 ) -> str:
-    """Resolve a track ID or its namespaced artist-and-track fallback."""
-    if identifier is not None and identifier.strip():
-        return identifier
-    if (
-        artist_name is not None
-        and artist_name.strip()
-        and track_name is not None
-        and track_name.strip()
-    ):
-        return f"name::{artist_name}::{track_name}"
-    raise ValueError("a track requires an ID or both artist and track names")
+    """Backward-compatible item-key helper using canonical identity rules."""
+    artist_key = resolve_artist_key(artist_id, artist_name)
+    return resolve_item_key(identifier, artist_key, track_name)
 
 
 @dataclass(frozen=True, slots=True)
 class TrackMetadata:
     """Track and artist identity fields used by source pools.
 
-    IDs take precedence. A missing track ID falls back to
-    ``name::<artist_name>::<track_name>`` and a missing artist ID to
-    ``name::<artist_name>``. Internally observed event keys are stored in the
-    ID fields as already-resolved identity keys.
+    Raw source fields are retained when available. Generator-created metadata
+    stores already-resolved keys in the two optional override fields so the
+    original track ID is never mistaken for a canonical item key.
     """
 
     track_id: Optional[str]
     track_name: Optional[str]
     artist_id: Optional[str]
     artist_name: Optional[str]
+    resolved_item_key: Optional[str] = None
+    resolved_artist_key: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.resolved_item_key is not None and not is_canonical_item_key(
+            self.resolved_item_key
+        ):
+            raise ValueError("resolved_item_key must be canonical")
+        if self.resolved_artist_key is not None and not is_canonical_artist_key(
+            self.resolved_artist_key
+        ):
+            raise ValueError("resolved_artist_key must be canonical")
+        if self.resolved_item_key is not None and self.resolved_artist_key is not None:
+            if not self.resolved_item_key.endswith(self.resolved_artist_key):
+                raise ValueError("resolved item and artist keys do not match")
 
     @property
     def track_key(self) -> str:
-        """Canonical track key compatible with ``TemporalState`` queries."""
-        return resolve_track_identity_key(
-            self.track_id, self.artist_name, self.track_name
-        )
+        """Compatibility name for the canonical recommendation ``item_key``."""
+        return self.item_key
+
+    @property
+    def item_key(self) -> str:
+        """Canonical item key, including its artist identity."""
+        if self.resolved_item_key is not None:
+            return self.resolved_item_key
+        artist_key = self.artist_key
+        return resolve_item_key(self.track_id, artist_key, self.track_name)
 
     @property
     def artist_key(self) -> str:
         """Canonical artist key compatible with ``TemporalState`` queries."""
-        return resolve_identity_key(self.artist_id, self.artist_name)
+        if self.resolved_artist_key is not None:
+            return self.resolved_artist_key
+        return resolve_artist_key(self.artist_id, self.artist_name)
 
 
 class CandidateSource(str, Enum):
@@ -101,8 +116,13 @@ class Candidate:
 
     @property
     def track_key(self) -> str:
-        """Canonical key of the candidate track."""
-        return self.track.track_key
+        """Compatibility alias for :attr:`item_key`."""
+        return self.item_key
+
+    @property
+    def item_key(self) -> str:
+        """Canonical key of this recommendation item."""
+        return self.track.item_key
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,13 +254,17 @@ class CandidateGenerator:
         """Whether ``track_key`` has entered the state strictly before now."""
         return track_key in self._track_artists
 
+    def has_observed_item(self, item_key: str) -> bool:
+        """Whether ``item_key`` has entered the state strictly before now."""
+        return self.has_observed_track(item_key)
+
     def close(self) -> None:
         """Detach from the state when this generator is no longer needed."""
         self._state.remove_event_listener(self._observe_event)
         self._closed = True
 
     def _observe_event(self, event: PlayEvent) -> None:
-        track_key, artist_key = event.track_id, event.artist_id
+        track_key, artist_key = event.item_key, event.artist_key
         previous_artist = self._track_artists.get(track_key)
         if previous_artist is None:
             self._track_artists[track_key] = artist_key
@@ -253,16 +277,18 @@ class CandidateGenerator:
             )
 
         # The TemporalState applies the event before notifying listeners.
-        plays = self._state.get_track_play_count(track_key)
+        plays = self._state.get_item_play_count(track_key)
         self._popularity_heap.set_count(track_key, plays)
 
     def _metadata_for(self, track_key: str) -> TrackMetadata:
         """Build the output record for a track already present in the index."""
         return TrackMetadata(
-            track_id=track_key,
+            track_id=None,
             track_name=None,
-            artist_id=self._track_artists[track_key],
+            artist_id=None,
             artist_name=None,
+            resolved_item_key=track_key,
+            resolved_artist_key=self._track_artists[track_key],
         )
 
     def _top_popular_track_keys(self, limit: int) -> list[str]:
@@ -288,7 +314,7 @@ class CandidateGenerator:
         artist_heaps: dict[str, list[str]] = {}
         merge_heap: list[tuple[str, str]] = []
         temporarily_removed: dict[str, list[str]] = {}
-        for artist_key in self._state.iter_user_artist_ids(user_id):
+        for artist_key in self._state.iter_user_artist_keys(user_id):
             artist_heap = self._tracks_by_artist.get(artist_key)
             if not artist_heap:
                 continue
@@ -320,7 +346,7 @@ class CandidateGenerator:
         while self._observed_keys_heap and len(selected) < limit:
             track_key = heapq.heappop(self._observed_keys_heap)
             popped.append(track_key)
-            if self._state.get_user_track_count(user_id, track_key) == 0:
+            if self._state.get_user_item_count(user_id, track_key) == 0:
                 selected.append(track_key)
         for track_key in popped:
             heapq.heappush(self._observed_keys_heap, track_key)
@@ -400,11 +426,11 @@ class CandidateGenerator:
         merged: dict[str, Candidate] = {}
         for source_pool in (personal, popular, discovery):
             for candidate in source_pool:
-                previous = merged.get(candidate.track_key)
+                previous = merged.get(candidate.item_key)
                 if previous is None:
-                    merged[candidate.track_key] = candidate
+                    merged[candidate.item_key] = candidate
                 else:
-                    merged[candidate.track_key] = Candidate(
+                    merged[candidate.item_key] = Candidate(
                         track=previous.track,
                         sources=previous.sources | candidate.sources,
                         discovery_type=(

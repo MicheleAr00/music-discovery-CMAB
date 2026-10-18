@@ -11,6 +11,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, DefaultDict, Iterable, Iterator, Optional
 
+from src.data.identity import (
+    is_canonical_artist_key,
+    is_canonical_item_key,
+    resolve_event_identity_keys,
+)
 
 @dataclass(frozen=True, slots=True)
 class PlayEvent:
@@ -22,8 +27,44 @@ class PlayEvent:
 
     user_id: str
     timestamp: datetime
-    track_id: str
-    artist_id: str
+    item_key: str
+    artist_key: str
+
+    def __post_init__(self) -> None:
+        """Require canonical keys so raw IDs cannot be confused with keys."""
+        if not is_canonical_artist_key(self.artist_key):
+            raise ValueError("PlayEvent.artist_key must be a canonical artist key")
+        if not is_canonical_item_key(self.item_key):
+            raise ValueError("PlayEvent.item_key must be a canonical item key")
+        if not self.item_key.endswith(self.artist_key):
+            raise ValueError("PlayEvent item_key and artist_key identify different artists")
+
+    @classmethod
+    def from_raw(
+        cls,
+        user_id: str,
+        timestamp: datetime,
+        track_id: Optional[str],
+        artist_id: Optional[str],
+        *,
+        track_name: Optional[str] = None,
+        artist_name: Optional[str] = None,
+    ) -> PlayEvent:
+        """Build an event from original source identifiers and fallback text."""
+        item_key, artist_key = resolve_event_identity_keys(
+            artist_id, artist_name, track_id, track_name
+        )
+        return cls(user_id, timestamp, item_key, artist_key)
+
+    @property
+    def track_id(self) -> str:
+        """Compatibility alias; this value is the canonical ``item_key``."""
+        return self.item_key
+
+    @property
+    def artist_id(self) -> str:
+        """Compatibility alias; this value is the canonical ``artist_key``."""
+        return self.artist_key
 
 
 class TemporalState:
@@ -139,23 +180,27 @@ class TemporalState:
         """Iterate artist keys in the user's pre-decision history."""
         return iter(self._user_artist_counts.get(user_id, {}))
 
-    def _apply(self, event: PlayEvent) -> None:
-        user_id, track_id, artist_id = event.user_id, event.track_id, event.artist_id
-        self._user_event_count[user_id] += 1
-        self._user_track_counts[user_id][track_id] += 1
-        self._user_artist_counts[user_id][artist_id] += 1
-        self._user_track_last_timestamp[(user_id, track_id)] = event.timestamp
-        self._user_artist_last_timestamp[(user_id, artist_id)] = event.timestamp
+    def iter_user_artist_keys(self, user_id: str) -> Iterator[str]:
+        """Explicitly named alias for :meth:`iter_user_artist_ids`."""
+        return self.iter_user_artist_ids(user_id)
 
-        self._track_play_counts[track_id] += 1
-        if user_id not in self._track_seen_users[track_id]:
-            self._track_seen_users[track_id].add(user_id)
-            self._track_user_counts[track_id] += 1
-        self._artist_play_counts[artist_id] += 1
-        if user_id not in self._artist_seen_users[artist_id]:
-            self._artist_seen_users[artist_id].add(user_id)
-            self._artist_user_counts[artist_id] += 1
-        self._track_first_timestamp.setdefault(track_id, event.timestamp)
+    def _apply(self, event: PlayEvent) -> None:
+        user_id, item_key, artist_key = event.user_id, event.item_key, event.artist_key
+        self._user_event_count[user_id] += 1
+        self._user_track_counts[user_id][item_key] += 1
+        self._user_artist_counts[user_id][artist_key] += 1
+        self._user_track_last_timestamp[(user_id, item_key)] = event.timestamp
+        self._user_artist_last_timestamp[(user_id, artist_key)] = event.timestamp
+
+        self._track_play_counts[item_key] += 1
+        if user_id not in self._track_seen_users[item_key]:
+            self._track_seen_users[item_key].add(user_id)
+            self._track_user_counts[item_key] += 1
+        self._artist_play_counts[artist_key] += 1
+        if user_id not in self._artist_seen_users[artist_key]:
+            self._artist_seen_users[artist_key].add(user_id)
+            self._artist_user_counts[artist_key] += 1
+        self._track_first_timestamp.setdefault(item_key, event.timestamp)
 
     def get_user_event_count(self, user_id: str) -> int:
         """Return the number of pre-decision events for ``user_id``."""
@@ -257,6 +302,34 @@ class TemporalState:
         if reference < first:
             raise ValueError("age reference cannot precede the first play")
         return reference - first
+
+    # Explicit item-level API. The older ``track`` method names remain as
+    # compatibility aliases; all values passed to either API are item_keys,
+    # never source track IDs.
+    def get_user_item_count(self, user_id: str, item_key: str) -> int:
+        return self.get_user_track_count(user_id, item_key)
+
+    def get_item_play_count(self, item_key: str) -> int:
+        return self.get_track_play_count(item_key)
+
+    def get_item_user_count(self, item_key: str) -> int:
+        return self.get_track_user_count(item_key)
+
+    def get_item_first_timestamp(self, item_key: str) -> Optional[datetime]:
+        return self.get_track_first_timestamp(item_key)
+
+    def is_item_novel(self, user_id: str, item_key: str) -> bool:
+        return self.is_track_novel(user_id, item_key)
+
+    def get_user_item_recency(
+        self, user_id: str, item_key: str, at: Optional[datetime] = None
+    ) -> Optional[timedelta]:
+        return self.get_user_track_recency(user_id, item_key, at)
+
+    def get_item_age(
+        self, item_key: str, at: Optional[datetime] = None
+    ) -> Optional[timedelta]:
+        return self.get_track_age(item_key, at)
 
 
 # =============================================================================

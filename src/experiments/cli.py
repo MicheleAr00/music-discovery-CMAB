@@ -11,6 +11,40 @@ from src.experiments.runner import ExperimentRunner
 from src.experiments.smoke import run_synthetic_smoke
 
 
+class _MultipleCleanupErrors(RuntimeError):
+    """Keep every failure when more than one CLI resource fails to close."""
+
+    def __init__(self, errors: list[BaseException]) -> None:
+        self.errors = tuple(errors)
+        super().__init__(f"multiple errors while closing CLI resources ({len(errors)})")
+
+
+def _workspace_cache_directory(project_root: Path) -> Path:
+    """Create the ignored, project-local parent for temporary SQLite caches."""
+    directory = project_root / ".pytest-tmp" / "lastfm-sqlite-cache"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _close_resources(runner: ExperimentRunner | None, events) -> None:
+    """Attempt every close and report failures without dropping any of them."""
+    errors: list[BaseException] = []
+    if runner is not None:
+        try:
+            runner.close()
+        except BaseException as error:
+            errors.append(error)
+    try:
+        events.close()
+    except BaseException as error:
+        errors.append(error)
+
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise _MultipleCleanupErrors(errors) from errors[0]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path, nargs="?", help="JSON experiment configuration")
@@ -31,7 +65,9 @@ def main() -> None:
     dataset_path = Path(config.dataset_path)
     if not dataset_path.is_absolute():
         dataset_path = args.config.resolve().parent.parent.parent / dataset_path
-    events = load_lastfm_tsv(dataset_path)
+    project_root = Path(__file__).resolve().parents[2]
+    cache_directory = _workspace_cache_directory(project_root)
+    events = load_lastfm_tsv(dataset_path, temporary_directory=cache_directory)
     runner = None
     try:
         runner = ExperimentRunner(events, config)
@@ -45,10 +81,16 @@ def main() -> None:
         print(f"Completed runs: {len(runs)}")
         print(f"Results: {csv_path}")
         print(f"Detailed records: {jsonl_path}")
-    finally:
-        if runner is not None:
-            runner.close()
-        events.close()
+    except BaseException as primary_error:
+        try:
+            _close_resources(runner, events)
+        except BaseException as cleanup_error:
+            # Preserve the operation failure as the propagated exception;
+            # retain cleanup failure as its explicit cause.
+            raise primary_error from cleanup_error
+        raise
+    else:
+        _close_resources(runner, events)
 
 
 if __name__ == "__main__":

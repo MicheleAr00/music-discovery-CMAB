@@ -183,13 +183,13 @@ def _decision_to_dict(record: DecisionRecord) -> dict[str, Any]:
         "phase": record.phase,
         "user_id": record.user_id,
         "decision_time": record.decision_time.isoformat(),
-        "selected_track": record.selected_track,
+        "selected_item_key": record.selected_item_key,
         "selected_artist": record.selected_artist,
         "selected_score": record.selected_score,
         "reward": record.reward,
         "reward_available_time": record.reward_available_time.isoformat() if record.reward_available_time else None,
         "candidate_count": record.candidate_count,
-        "top_k_track_keys": [candidate.track_key for candidate in record.top_k_candidates],
+        "top_k_item_keys": [candidate.item_key for candidate in record.top_k_candidates],
         "top_k_artist_keys": [candidate.track.artist_key for candidate in record.top_k_candidates],
         "top_k_scores": list(record.top_k_scores),
         "top_k_effective_size": record.top_k_effective_size,
@@ -231,7 +231,7 @@ class _RecordingGenerator:
         pools = self._delegate.generate(user_id, timestamp, pool_depth)
         if self.recording:
             payload = json.dumps(
-                (user_id, timestamp.isoformat(), tuple(c.track_key for c in pools.candidates)),
+                (user_id, timestamp.isoformat(), tuple(c.item_key for c in pools.candidates)),
                 separators=(",", ":"), ensure_ascii=False,
             ).encode("utf-8")
             self._digest.update(len(payload).to_bytes(8, "big"))
@@ -295,10 +295,11 @@ class ExperimentRunner:
         test_start, test_end = protocol.test_bounds
         counts: dict[str, dict[str, int]] = {}
         dataset_digest = hashlib.sha256()
+        dataset_digest.update(b"identity-schema:typed-item-artist-framed-v2\0")
 
         for event in self.events:
             payload = json.dumps(
-                (event.user_id, event.timestamp.isoformat(), event.track_id, event.artist_id),
+                (event.user_id, event.timestamp.isoformat(), event.item_key, event.artist_key),
                 separators=(",", ":"), ensure_ascii=False,
             ).encode("utf-8")
             dataset_digest.update(len(payload).to_bytes(8, "big"))
