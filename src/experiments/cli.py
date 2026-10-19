@@ -49,6 +49,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path, nargs="?", help="JSON experiment configuration")
     parser.add_argument("--output-directory", type=Path, help="override configured results directory")
+    parser.add_argument(
+        "--checkpoint-directory",
+        type=Path,
+        help="persistent validation checkpoint directory (defaults under results_directory)",
+    )
     parser.add_argument("--smoke", action="store_true", help="run the small synthetic five-policy pipeline")
     args = parser.parse_args()
 
@@ -62,6 +67,8 @@ def main() -> None:
         parser.error("provide a configuration file or use --smoke")
 
     config = ExperimentConfig.from_json(args.config)
+    if config.mode == "final_test" and args.checkpoint_directory is not None:
+        parser.error("--checkpoint-directory is available only for validation_sweep")
     dataset_path = Path(config.dataset_path)
     if not dataset_path.is_absolute():
         dataset_path = args.config.resolve().parent.parent.parent / dataset_path
@@ -72,13 +79,16 @@ def main() -> None:
     try:
         runner = ExperimentRunner(events, config)
         runs = (
-            runner.run_validation_sweep()
+            runner.run_validation_sweep(args.checkpoint_directory)
             if config.mode == "validation_sweep"
             else runner.run_final_test()
         )
         csv_path, jsonl_path = runner.write_results(runs, args.output_directory)
         print(f"Eligible users: {len(runner.eligible_users)}")
         print(f"Completed runs: {len(runs)}")
+        if config.mode == "validation_sweep":
+            print(f"Resumed runs: {runner.resumed_run_count}")
+            print(f"Checkpoints: {runner.checkpoint_directory}")
         print(f"Results: {csv_path}")
         print(f"Detailed records: {jsonl_path}")
     except BaseException as primary_error:

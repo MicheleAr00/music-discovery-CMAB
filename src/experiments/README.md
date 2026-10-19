@@ -23,10 +23,29 @@ finally:
     events.close()
 ```
 
-Validation sweeps keep only compact run summaries in memory. Full per-decision
-records are streamed to temporary files and copied into `runs.jsonl` by
-`write_results()`. Keep the runner open until results have been written, then
-call `runner.close()` to remove its temporary detail files.
+Validation sweeps keep only compact run summaries in memory. Each completed
+configuration is also saved as an atomic, persistent checkpoint under
+`experiments/results/checkpoints/<config-hash>-<dataset-hash>/` by default.
+The checkpoint detail JSONL is installed before a completion marker containing
+the config, policy, N, seeds, dataset/code hashes, Git commit when available,
+eligible-user and scaler/candidate digests, runtime breakdown, and a SHA-256
+checksum. The checkpoint directory must be outside temporary storage; if it is
+inside the repository, it must be Git-ignored. The default results directory
+is ignored by Git.
+
+To resume, rerun the same validation CLI command with the same config and
+dataset. The runner verifies all checkpoint identities and checksums, fails
+explicitly on incomplete, corrupt, or incompatible files, and skips only
+verified completed configurations. It rebuilds the N-specific warm-up
+artifact needed after restart, then aggregates all planned configurations
+exactly once. `--checkpoint-directory <path>` can select another persistent,
+ignored location. The final-test mode does not read or write validation
+checkpoints.
+
+Full per-decision records are streamed into persistent checkpoints as each run
+finishes. Once the sweep is complete, `write_results()` creates the aggregate
+CSV and JSONL. Keep the runner open until those outputs have been written, then
+call `runner.close()` to remove any runner-owned temporary detail files.
 
 The Last.fm TSV loader makes a disk-backed chronological SQLite cache because
 the bundled source file is reverse ordered. It resolves missing track/artist

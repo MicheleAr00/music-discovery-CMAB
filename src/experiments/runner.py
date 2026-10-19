@@ -15,7 +15,10 @@ from itertools import groupby
 import hashlib
 import itertools
 import json
+import math
+import os
 from pathlib import Path
+import subprocess
 import shutil
 import tempfile
 from time import perf_counter
@@ -52,6 +55,28 @@ from src.simulation.simulator import (
 from types import MappingProxyType
 
 
+_CHECKPOINT_FORMAT_VERSION = 1
+_CHECKPOINT_CODE_FILES = (
+    "src/data/identity.py",
+    "src/data/state.py",
+    "src/evaluation/metrics.py",
+    "src/experiments/config.py",
+    "src/experiments/dataset.py",
+    "src/experiments/runner.py",
+    "src/recommender/policies.py",
+    "src/simulation/candidate_generator.py",
+    "src/simulation/context.py",
+    "src/simulation/linucb.py",
+    "src/simulation/reward.py",
+    "src/simulation/scaler.py",
+    "src/simulation/simulator.py",
+)
+
+
+class CheckpointError(RuntimeError):
+    """A persistent validation checkpoint is incomplete or incompatible."""
+
+
 @dataclass(frozen=True, slots=True)
 class ExperimentRun:
     """Metrics and provenance for one run; validation details may be disk-backed."""
@@ -63,6 +88,8 @@ class ExperimentRun:
     policy_parameters: Mapping[str, Any]
     dataset_id: str
     dataset_content_hash: str
+    git_commit: Optional[str]
+    experiment_code_digest: str
     random_seed: int
     candidate_pool_depth: int
     k_values: tuple[int, ...]
@@ -76,6 +103,8 @@ class ExperimentRun:
     recall_undefined_decisions: int
     warmup: WarmupResult
     runtime_seconds: float
+    warmup_runtime_seconds: float
+    simulation_runtime_seconds: float
     created_at_utc: str
     candidate_pool_digest: str
     scaler_digest: str
@@ -87,6 +116,7 @@ class ExperimentRun:
         temporal = config.temporal
         row: dict[str, Any] = {
             "run_id": self.run_id,
+            "completion_status": "completed",
             "created_at_utc": self.created_at_utc,
             "configuration_hash": self.configuration_hash,
             "evaluation_phase": self.evaluation_phase,
@@ -96,6 +126,8 @@ class ExperimentRun:
             "epsilon": self.policy_parameters.get("epsilon"),
             "dataset": self.dataset_id,
             "dataset_content_hash": self.dataset_content_hash,
+            "git_commit": self.git_commit,
+            "experiment_code_digest": self.experiment_code_digest,
             "dataset_path": config.dataset_path,
             "seed": config.seed,
             "random_seed": self.random_seed,
@@ -121,12 +153,15 @@ class ExperimentRun:
             "feedback_pending_at_end": self.simulation.feedback_pending_at_end,
             "recall_undefined_decisions": self.recall_undefined_decisions,
             "runtime_seconds": self.runtime_seconds,
+            "warmup_runtime_seconds": self.warmup_runtime_seconds,
+            "simulation_runtime_seconds": self.simulation_runtime_seconds,
             "selection_metric": config.selection_metric,
             "selection_direction": config.selection_direction,
             "eligible_user_hash": hashlib.sha256(
                 "\n".join(sorted(self.eligible_users)).encode("utf-8")
             ).hexdigest(),
             "scaler_digest": self.scaler_digest,
+            "candidate_pool_digest": self.candidate_pool_digest,
             "warmup_decision_points": self.warmup.decision_points,
             "warmup_context_rows": self.warmup.context_rows,
             "warmup_state_events_processed": self.warmup.state_events_processed,
@@ -192,6 +227,68 @@ class _WarmupArtifact:
     scaler_mean: tuple[float, ...]
     scaler_scale: tuple[float, ...]
     scaler_digest: str
+
+
+def _current_git_commit(project_root: Path) -> Optional[str]:
+    """Return the checked-out commit when this workspace is a Git checkout."""
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    value = completed.stdout.strip()
+    return value or None
+
+
+def _experiment_code_digest(project_root: Path) -> str:
+    """Hash every source module that can affect validation results."""
+    digest = hashlib.sha256()
+    for relative_path in _CHECKPOINT_CODE_FILES:
+        path = project_root / relative_path
+        try:
+            contents = path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot fingerprint experiment source {relative_path!r}"
+            ) from exc
+        name = relative_path.encode("utf-8")
+        digest.update(len(name).to_bytes(4, "big"))
+        digest.update(name)
+        digest.update(len(contents).to_bytes(8, "big"))
+        digest.update(contents)
+    return digest.hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_write(path: Path, writer) -> None:
+    """Write one file in the target directory and atomically install it."""
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+            writer(stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        finally:
+            raise
 
 
 def _decision_to_dict(record: DecisionRecord) -> dict[str, Any]:
@@ -278,6 +375,9 @@ class ExperimentRunner:
             raise TypeError("events must be a repeatable chronological Sequence[PlayEvent]")
         self.events = events
         self.config = config
+        self._project_root = Path(__file__).resolve().parents[2]
+        self.git_commit = _current_git_commit(self._project_root)
+        self.experiment_code_digest = _experiment_code_digest(self._project_root)
         (
             self._eligible_users,
             self.eligibility_counts,
@@ -294,6 +394,9 @@ class ExperimentRunner:
         # Validation reuses only immutable warm-up artifacts, one per N. Each
         # run still owns fresh state, candidate index, scaler, and policy.
         self._warmup_artifacts: dict[int, _WarmupArtifact] = {}
+        self.checkpoint_directory: Optional[Path] = None
+        self.resumed_run_count = 0
+        self.recovery_warmup_seconds: dict[int, float] = {}
         # Detailed validation decisions are spooled per run. Keeping the
         # TemporaryDirectory alive on the runner preserves write_results()
         # while allowing each heavy SimulationResult to be released at once.
@@ -368,59 +471,473 @@ class ExperimentRunner:
         )
         return eligible, counts, dataset_digest.hexdigest()
 
-    def run_validation_sweep(self) -> tuple[ExperimentRun, ...]:
-        """Run the configured grid while retaining only compact run summaries.
+    def run_validation_sweep(
+        self, checkpoint_directory: str | Path | None = None
+    ) -> tuple[ExperimentRun, ...]:
+        """Run or resume the validation grid from persistent per-run checkpoints.
 
-        Detailed per-decision JSON is spooled to disk as each run completes;
-        the returned records keep scalar counters and metrics but not the
-        candidate/context-heavy decision tuple. This bounds retained sweep
-        memory to one active simulation plus compact summaries.
+        Each completed configuration is atomically written as a detailed JSONL
+        record followed by a completion marker containing its checksum and
+        provenance. A fresh runner can verify and reuse those records while
+        rebuilding one independent warm-up artifact for each N.
         """
         if self.config.mode != "validation_sweep":
             raise ValueError("run_validation_sweep requires mode='validation_sweep'")
         if not self.eligible_users:
             raise ValueError("no users satisfy the configured N_min eligibility rule")
+        checkpoint_root = self._resolve_checkpoint_directory(checkpoint_directory)
+        self.checkpoint_directory = checkpoint_root
+        planned: list[tuple[int, str, dict[str, Any], str]] = []
+        for depth in self.config.candidate_pool_depths:
+            for policy_name, params in self._validation_policy_grid():
+                normalized_params = self._normalized_policy_parameters(policy_name, params)
+                run_id = self._run_identifier(
+                    "validation", policy_name, normalized_params, depth
+                )
+                planned.append((depth, policy_name, normalized_params, run_id))
+        expected_run_ids = [row[3] for row in planned]
+        if len(set(expected_run_ids)) != len(expected_run_ids):
+            raise RuntimeError("validation grid generated duplicate run identifiers")
+
+        completed = self._load_validation_checkpoints(
+            checkpoint_root, planned
+        )
         runs: list[ExperimentRun] = []
         pool_traces: dict[int, tuple[str, str]] = {}
-        spool_root = Path(self.config.results_directory)
-        spool_root.mkdir(parents=True, exist_ok=True)
-        spool = tempfile.TemporaryDirectory(
-            prefix="music-discovery-validation-", dir=spool_root
-        )
-        try:
-            for depth in self.config.candidate_pool_depths:
-                for policy_name, params in self._validation_policy_grid():
+        for depth in self.config.candidate_pool_depths:
+            depth_plan = [row for row in planned if row[0] == depth]
+            depth_has_checkpoints = any(row[3] in completed for row in depth_plan)
+            if depth_has_checkpoints and depth not in self._warmup_artifacts:
+                recovery_started = perf_counter()
+                artifact = self._build_warmup_artifact(depth)
+                self._warmup_artifacts[depth] = artifact
+                self.recovery_warmup_seconds[depth] = perf_counter() - recovery_started
+                for _, _, _, run_id in depth_plan:
+                    cached = completed.get(run_id)
+                    if cached is not None:
+                        if cached["identity"]["scaler_digest"] != artifact.scaler_digest:
+                            raise CheckpointError(
+                                f"checkpoint {run_id} has a scaler digest incompatible with rebuilt warm-up"
+                            )
+                        warmup_summary = cached["summary"]
+                        warmup_values = {
+                            "warmup_decision_points": artifact.result.decision_points,
+                            "warmup_context_rows": artifact.result.context_rows,
+                            "warmup_state_events_processed": artifact.result.state_events_processed,
+                        }
+                        if any(
+                            warmup_summary.get(name) != expected_value
+                            for name, expected_value in warmup_values.items()
+                        ):
+                            raise CheckpointError(
+                                f"checkpoint {run_id} warm-up counts differ from rebuilt artifact"
+                            )
+
+            for _, policy_name, params, run_id in depth_plan:
+                cached = completed.get(run_id)
+                if cached is not None:
+                    run = self._restore_checkpoint_run(
+                        cached, checkpoint_root / f"{run_id}.jsonl"
+                    )
+                    self.resumed_run_count += 1
+                else:
+                    run_started = perf_counter()
                     full_run = self._run_one(
                         "validation", policy_name, params, depth,
                         warmup_artifact=self._warmup_artifacts.get(depth),
                     )
-                    signatures = (full_run.candidate_pool_digest, full_run.scaler_digest)
-                    previous = pool_traces.setdefault(depth, signatures)
-                    if previous != signatures:
-                        raise RuntimeError(
-                            "fairness violation: policy/parameter changed candidate pools or warm-up scaler"
-                        )
-                    detail_path = Path(spool.name) / f"{full_run.run_id}.jsonl"
-                    with detail_path.open("w", encoding="utf-8") as stream:
-                        _write_run_json_line(stream, full_run, self.config)
-                    compact_simulation = replace(
-                        full_run.simulation,
-                        decisions=(),
-                        eligible_catalog=frozenset(),
-                        eligible_artists=frozenset(),
+                    full_run = replace(
+                        full_run, runtime_seconds=perf_counter() - run_started
                     )
-                    runs.append(replace(
-                        full_run,
-                        simulation=compact_simulation,
-                        details_path=str(detail_path),
-                        _details_owner=spool,
-                    ))
-                    del full_run, compact_simulation
-        except Exception:
-            spool.cleanup()
-            raise
-        self._validation_spools.append(spool)
+                    self._write_validation_checkpoint(checkpoint_root, full_run)
+                    run = self._compact_checkpoint_run(
+                        full_run, checkpoint_root / f"{run_id}.jsonl"
+                    )
+                    del full_run
+
+                signatures = (run.candidate_pool_digest, run.scaler_digest)
+                previous = pool_traces.setdefault(depth, signatures)
+                if previous != signatures:
+                    raise RuntimeError(
+                        "fairness violation: policy/parameter changed candidate pools or warm-up scaler"
+                    )
+                runs.append(run)
+
+        observed_ids = [run.run_id for run in runs]
+        if len(observed_ids) != len(set(observed_ids)):
+            raise CheckpointError("validation result aggregation contains duplicate run IDs")
+        if set(observed_ids) != set(expected_run_ids) or len(observed_ids) != len(expected_run_ids):
+            raise CheckpointError("validation result aggregation is missing planned configurations")
         return tuple(runs)
+
+    def _resolve_checkpoint_directory(
+        self, checkpoint_directory: str | Path | None
+    ) -> Path:
+        """Choose a persistent, ignored checkpoint directory for this sweep."""
+        if checkpoint_directory is None:
+            root = Path(self.config.results_directory) / "checkpoints" / (
+                f"{self.config.configuration_hash[:12]}-{self.dataset_content_hash[:12]}"
+            )
+        else:
+            root = Path(checkpoint_directory)
+        root = root.resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            root.relative_to(self._project_root)
+        except ValueError:
+            pass
+        else:
+            ignored = subprocess.run(
+                ["git", "check-ignore", "--quiet", str(root)],
+                cwd=self._project_root,
+                check=False,
+                capture_output=True,
+            )
+            if ignored.returncode != 0:
+                raise ValueError(
+                    "checkpoint directory inside the repository must be ignored by Git"
+                )
+        return root
+
+    def _normalized_policy_parameters(
+        self, policy_name: str, params: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        normalized = dict(params)
+        if policy_name in {"random", "epsilon_greedy"}:
+            normalized["random_seed"] = int(
+                normalized.get("random_seed", self.config.random_seed)
+            )
+        return normalized
+
+    def _run_identifier(
+        self,
+        phase: str,
+        policy_name: str,
+        params: Mapping[str, Any],
+        depth: int,
+    ) -> str:
+        identity = json.dumps(
+            {
+                "configuration_hash": self.config.configuration_hash,
+                "dataset_content_hash": self.dataset_content_hash,
+                "phase": phase,
+                "policy": policy_name,
+                "parameters": dict(params),
+                "depth": depth,
+            }, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+
+    def _build_warmup_artifact(self, depth: int) -> _WarmupArtifact:
+        """Rebuild one N-specific scaler and fresh state after a resumed run."""
+        state = TemporalState(self.events)
+        generator = CandidateGenerator(state)
+        simulator = SequentialOfflineBanditSimulator(
+            events=self.events,
+            eligible_users=self.eligible_users,
+            state=state,
+            candidate_generator=generator,
+            context_builder=ContextBuilder(state),
+            scaler=FeatureScaler(),
+            reward_calculator=self._reward_calculator,
+            policy=self._policy("random", {}),
+            candidate_pool_depth=depth,
+            top_k=self.config.top_k,
+            session_gap=self.config.temporal.session_gap,
+            reward_horizon=self.config.temporal.reward_horizon,
+        )
+        warm_start, warm_end = self.config.temporal.warmup_bounds
+        try:
+            result = simulator.prepare_warmup(warm_start, warm_end)
+            mean = tuple(simulator.scaler.mean_)
+            scale = tuple(simulator.scaler.scale_)
+        finally:
+            generator.close()
+        return _WarmupArtifact(
+            configuration_hash=self.config.configuration_hash,
+            dataset_content_hash=self.dataset_content_hash,
+            candidate_pool_depth=depth,
+            warmup_start=warm_start,
+            warmup_end=warm_end,
+            session_gap=self.config.temporal.session_gap,
+            result=result,
+            scaler_mean=mean,
+            scaler_scale=scale,
+            scaler_digest=self._scaler_digest(mean, scale),
+        )
+
+    def _checkpoint_identity(self, run: ExperimentRun) -> dict[str, Any]:
+        eligible_hash = hashlib.sha256(
+            "\n".join(sorted(run.eligible_users)).encode("utf-8")
+        ).hexdigest()
+        return {
+            "run_id": run.run_id,
+            "configuration_hash": run.configuration_hash,
+            "dataset_content_hash": run.dataset_content_hash,
+            "experiment_code_digest": run.experiment_code_digest,
+            "git_commit": run.git_commit,
+            "evaluation_phase": run.evaluation_phase,
+            "policy": run.policy,
+            "policy_parameters": dict(run.policy_parameters),
+            "candidate_pool_depth": run.candidate_pool_depth,
+            "seed": self.config.seed,
+            "random_seed": run.random_seed,
+            "eligible_users_hash": eligible_hash,
+            "eligible_user_count": len(run.eligible_users),
+            "scaler_digest": run.scaler_digest,
+            "candidate_pool_digest": run.candidate_pool_digest,
+        }
+
+    def _write_validation_checkpoint(
+        self, checkpoint_root: Path, run: ExperimentRun
+    ) -> None:
+        detail_path = checkpoint_root / f"{run.run_id}.jsonl"
+        marker_path = checkpoint_root / f"{run.run_id}.checkpoint.json"
+        if detail_path.exists() or marker_path.exists():
+            raise CheckpointError(
+                f"refusing to overwrite an existing checkpoint for run {run.run_id}"
+            )
+        _atomic_write(
+            detail_path,
+            lambda stream: _write_run_json_line(stream, run, self.config),
+        )
+        details_hash = _sha256_file(detail_path)
+        marker = {
+            "checkpoint_format_version": _CHECKPOINT_FORMAT_VERSION,
+            "completion_status": "completed",
+            "identity": self._checkpoint_identity(run),
+            "summary": run.summary_row(self.config),
+            "metrics": dict(run.metrics),
+            "eligible_users": sorted(run.eligible_users),
+            "eligibility_counts": {
+                user: dict(counts)
+                for user, counts in run.eligibility_counts.items()
+            },
+            "timings": {
+                "total_seconds": run.runtime_seconds,
+                "warmup_or_restore_seconds": run.warmup_runtime_seconds,
+                "simulation_seconds": run.simulation_runtime_seconds,
+            },
+            "result_filename": detail_path.name,
+            "result_sha256": details_hash,
+        }
+
+        def write_marker(stream) -> None:
+            json.dump(marker, stream, sort_keys=True, ensure_ascii=False)
+            stream.write("\n")
+
+        _atomic_write(marker_path, write_marker)
+
+    def _load_validation_checkpoints(
+        self,
+        checkpoint_root: Path,
+        planned: Sequence[tuple[int, str, dict[str, Any], str]],
+    ) -> dict[str, dict[str, Any]]:
+        expected = {row[3]: row for row in planned}
+        stale_temporary = tuple(checkpoint_root.glob("*.tmp")) + tuple(
+            checkpoint_root.glob(".*.tmp")
+        )
+        if stale_temporary:
+            raise CheckpointError(
+                "incomplete atomic checkpoint write found: "
+                + ", ".join(path.name for path in stale_temporary)
+            )
+        marker_paths = tuple(sorted(checkpoint_root.glob("*.checkpoint.json")))
+        marker_ids = {path.name.removesuffix(".checkpoint.json") for path in marker_paths}
+        orphan_details = tuple(
+            path for path in checkpoint_root.glob("*.jsonl")
+            if path.stem not in marker_ids
+        )
+        if orphan_details:
+            raise CheckpointError(
+                "checkpoint detail file has no completion marker: "
+                + ", ".join(path.name for path in orphan_details)
+            )
+
+        completed: dict[str, dict[str, Any]] = {}
+        eligible_hash = hashlib.sha256(
+            "\n".join(sorted(self.eligible_users)).encode("utf-8")
+        ).hexdigest()
+        for marker_path in marker_paths:
+            run_id = marker_path.name.removesuffix(".checkpoint.json")
+            if run_id not in expected:
+                raise CheckpointError(
+                    f"checkpoint {marker_path.name} does not belong to the configured grid"
+                )
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise CheckpointError(f"corrupt checkpoint marker {marker_path}") from exc
+            if marker.get("checkpoint_format_version") != _CHECKPOINT_FORMAT_VERSION:
+                raise CheckpointError(f"unsupported checkpoint format in {marker_path}")
+            if marker.get("completion_status") != "completed":
+                raise CheckpointError(f"checkpoint is not marked complete: {marker_path}")
+            identity = marker.get("identity")
+            if not isinstance(identity, dict):
+                raise CheckpointError(f"checkpoint identity is missing: {marker_path}")
+            depth, policy_name, params, expected_id = expected[run_id]
+            expected_identity = {
+                "run_id": expected_id,
+                "configuration_hash": self.config.configuration_hash,
+                "dataset_content_hash": self.dataset_content_hash,
+                "experiment_code_digest": self.experiment_code_digest,
+                "git_commit": self.git_commit,
+                "evaluation_phase": "validation",
+                "policy": policy_name,
+                "policy_parameters": params,
+                "candidate_pool_depth": depth,
+                "seed": self.config.seed,
+                "random_seed": int(params.get("random_seed", self.config.random_seed)),
+                "eligible_users_hash": eligible_hash,
+                "eligible_user_count": len(self.eligible_users),
+            }
+            for key, value in expected_identity.items():
+                if identity.get(key) != value:
+                    raise CheckpointError(
+                        f"checkpoint {run_id} is incompatible: {key} differs"
+                    )
+            detail_name = f"{run_id}.jsonl"
+            if marker.get("result_filename") != detail_name:
+                raise CheckpointError(f"checkpoint result filename mismatch: {marker_path}")
+            detail_path = checkpoint_root / detail_name
+            if not detail_path.is_file():
+                raise CheckpointError(f"checkpoint result is missing: {detail_path}")
+            if _sha256_file(detail_path) != marker.get("result_sha256"):
+                raise CheckpointError(f"checkpoint result checksum mismatch: {detail_path}")
+            summary = marker.get("summary")
+            if not isinstance(summary, dict):
+                raise CheckpointError(f"checkpoint summary is missing: {marker_path}")
+            summary_expected = {
+                "run_id": run_id,
+                "completion_status": "completed",
+                "configuration_hash": self.config.configuration_hash,
+                "dataset_content_hash": self.dataset_content_hash,
+                "git_commit": self.git_commit,
+                "experiment_code_digest": self.experiment_code_digest,
+                "evaluation_phase": "validation",
+                "policy": policy_name,
+                "policy_parameters": json.dumps(params, sort_keys=True),
+                "candidate_pool_depth": depth,
+                "seed": self.config.seed,
+                "random_seed": int(params.get("random_seed", self.config.random_seed)),
+                "eligible_user_hash": eligible_hash,
+            }
+            for key, value in summary_expected.items():
+                if summary.get(key) != value:
+                    raise CheckpointError(
+                        f"checkpoint result {run_id} is incompatible: summary {key} differs"
+                    )
+            if identity.get("scaler_digest") != summary.get("scaler_digest"):
+                raise CheckpointError(f"checkpoint scaler digest mismatch: {run_id}")
+            if identity.get("candidate_pool_digest") != summary.get("candidate_pool_digest"):
+                raise CheckpointError(f"checkpoint candidate digest mismatch: {run_id}")
+            eligible_users = marker.get("eligible_users")
+            if not isinstance(eligible_users, list) or hashlib.sha256(
+                "\n".join(sorted(eligible_users)).encode("utf-8")
+            ).hexdigest() != eligible_hash:
+                raise CheckpointError(f"checkpoint eligible-user list mismatch: {run_id}")
+            result_counts = marker.get("eligibility_counts")
+            if not isinstance(result_counts, dict) or set(result_counts) != set(self.eligibility_counts):
+                raise CheckpointError(f"checkpoint eligibility counts mismatch: {run_id}")
+            normalized_counts = {
+                user: {name: int(value) for name, value in counts.items()}
+                for user, counts in result_counts.items()
+            }
+            if normalized_counts != self.eligibility_counts:
+                raise CheckpointError(f"checkpoint eligibility values mismatch: {run_id}")
+            if not isinstance(marker.get("metrics"), dict):
+                raise CheckpointError(f"checkpoint metrics are missing: {run_id}")
+            for key, value in marker["metrics"].items():
+                if summary.get(key) != value:
+                    raise CheckpointError(f"checkpoint metric mismatch for {key}: {run_id}")
+            timings = marker.get("timings")
+            if not isinstance(timings, dict) or any(
+                not isinstance(timings.get(name), (int, float))
+                or not math.isfinite(timings[name])
+                or timings[name] < 0
+                for name in (
+                    "total_seconds", "warmup_or_restore_seconds", "simulation_seconds"
+                )
+            ):
+                raise CheckpointError(f"checkpoint timings are invalid: {run_id}")
+            if summary.get("n_decision_points_total") != summary.get("n_decisions", 0) + summary.get("empty_pool_decisions_excluded", 0):
+                raise CheckpointError(f"checkpoint decision counts are inconsistent: {run_id}")
+            if not isinstance(identity.get("candidate_pool_digest"), str) or len(identity["candidate_pool_digest"]) != 64:
+                raise CheckpointError(f"checkpoint candidate digest is invalid: {run_id}")
+            if marker["timings"]["total_seconds"] != summary.get("runtime_seconds"):
+                raise CheckpointError(f"checkpoint total runtime mismatch: {run_id}")
+            if marker["timings"]["warmup_or_restore_seconds"] != summary.get("warmup_runtime_seconds"):
+                raise CheckpointError(f"checkpoint warm-up runtime mismatch: {run_id}")
+            if marker["timings"]["simulation_seconds"] != summary.get("simulation_runtime_seconds"):
+                raise CheckpointError(f"checkpoint simulation runtime mismatch: {run_id}")
+            completed[run_id] = marker
+        return completed
+
+    def _restore_checkpoint_run(
+        self,
+        marker: Mapping[str, Any],
+        detail_path: Path,
+    ) -> ExperimentRun:
+        summary = marker["summary"]
+        identity = marker["identity"]
+        phase = str(summary["evaluation_phase"])
+        simulation = SimulationResult(
+            phase=phase,
+            decisions=(),
+            decision_points=int(summary["n_decision_points_total"]),
+            skipped_decisions=int(summary["skipped_decisions"]),
+            feedback_scheduled=int(summary["feedback_scheduled"]),
+            feedback_applied=int(summary["feedback_applied"]),
+            feedback_pending_at_end=int(summary["feedback_pending_at_end"]),
+        )
+        warmup = WarmupResult(
+            decision_points=int(summary["warmup_decision_points"]),
+            context_rows=int(summary["warmup_context_rows"]),
+            state_events_processed=int(summary["warmup_state_events_processed"]),
+        )
+        return ExperimentRun(
+            run_id=str(summary["run_id"]),
+            configuration_hash=str(summary["configuration_hash"]),
+            evaluation_phase=phase,
+            policy=str(summary["policy"]),
+            policy_parameters=json.loads(summary["policy_parameters"]),
+            dataset_id=str(summary["dataset"]),
+            dataset_content_hash=str(summary["dataset_content_hash"]),
+            git_commit=summary.get("git_commit"),
+            experiment_code_digest=str(summary["experiment_code_digest"]),
+            random_seed=int(summary["random_seed"]),
+            candidate_pool_depth=int(summary["candidate_pool_depth"]),
+            k_values=self.config.k_values,
+            eligible_users=frozenset(marker["eligible_users"]),
+            eligibility_counts={
+                user: {name: int(value) for name, value in counts.items()}
+                for user, counts in marker["eligibility_counts"].items()
+            },
+            simulation=simulation,
+            metrics=dict(marker["metrics"]),
+            users_evaluated=int(summary["n_users"]),
+            evaluable_decisions=int(summary["n_decisions"]),
+            empty_pool_decisions_excluded=int(summary["empty_pool_decisions_excluded"]),
+            recall_undefined_decisions=int(summary["recall_undefined_decisions"]),
+            warmup=warmup,
+            runtime_seconds=float(marker["timings"]["total_seconds"]),
+            warmup_runtime_seconds=float(marker["timings"]["warmup_or_restore_seconds"]),
+            simulation_runtime_seconds=float(marker["timings"]["simulation_seconds"]),
+            created_at_utc=str(summary["created_at_utc"]),
+            candidate_pool_digest=str(identity["candidate_pool_digest"]),
+            scaler_digest=str(identity["scaler_digest"]),
+            details_path=str(detail_path),
+        )
+
+    @staticmethod
+    def _compact_checkpoint_run(run: ExperimentRun, detail_path: Path) -> ExperimentRun:
+        compact_simulation = replace(
+            run.simulation,
+            decisions=(),
+            eligible_catalog=frozenset(),
+            eligible_artists=frozenset(),
+        )
+        return replace(run, simulation=compact_simulation, details_path=str(detail_path))
 
     def close(self) -> None:
         """Release temporary per-run validation detail files owned by runner."""
@@ -639,6 +1156,7 @@ class ExperimentRunner:
             reward_horizon=self.config.temporal.reward_horizon,
         )
         warm_start, warm_end = self.config.temporal.warmup_bounds
+        warmup_started = perf_counter()
         if warmup_artifact is None:
             warmup = simulator.prepare_warmup(warm_start, warm_end)
             scaler_mean = tuple(simulator.scaler.mean_)
@@ -671,12 +1189,15 @@ class ExperimentRunner:
             )
             if scaler_digest != warmup_artifact.scaler_digest:
                 raise RuntimeError("imported warm-up scaler digest differs from its artifact")
+        warmup_runtime = perf_counter() - warmup_started
         recording_generator.start_recording()
         if phase == "validation":
             start, end = self.config.temporal.validation_bounds
         else:
             start, end = self.config.temporal.test_bounds
+        simulation_started = perf_counter()
         simulation = simulator.run_phase(phase, start, end)
+        simulation_runtime = perf_counter() - simulation_started
         recording_generator.recording = False
         if recording_generator.recorded_decisions != simulation.decision_points:
             raise RuntimeError("candidate generator must run exactly once per decision point")
@@ -690,17 +1211,7 @@ class ExperimentRunner:
         parameters = dict(params)
         if policy_name in {"random", "epsilon_greedy"}:
             parameters["random_seed"] = int(params.get("random_seed", self.config.random_seed))
-        identity = json.dumps(
-            {
-                "configuration_hash": self.config.configuration_hash,
-                "dataset_content_hash": self.dataset_content_hash,
-                "phase": phase,
-                "policy": policy_name,
-                "parameters": parameters,
-                "depth": depth,
-            }, sort_keys=True, separators=(",", ":")
-        )
-        run_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+        run_id = self._run_identifier(phase, policy_name, parameters, depth)
         return ExperimentRun(
             run_id=run_id,
             configuration_hash=self.config.configuration_hash,
@@ -709,6 +1220,8 @@ class ExperimentRunner:
             policy_parameters=parameters,
             dataset_id=self.config.dataset_id,
             dataset_content_hash=self.dataset_content_hash,
+            git_commit=self.git_commit,
+            experiment_code_digest=self.experiment_code_digest,
             random_seed=int(parameters.get("random_seed", self.config.random_seed)),
             candidate_pool_depth=depth,
             k_values=self.config.k_values,
@@ -724,6 +1237,8 @@ class ExperimentRunner:
             recall_undefined_decisions=evaluated.recall_excluded_decisions,
             warmup=warmup,
             runtime_seconds=perf_counter() - started,
+            warmup_runtime_seconds=warmup_runtime,
+            simulation_runtime_seconds=simulation_runtime,
             created_at_utc=datetime.now(timezone.utc).isoformat(),
             candidate_pool_digest=recording_generator.digest,
             scaler_digest=scaler_digest,

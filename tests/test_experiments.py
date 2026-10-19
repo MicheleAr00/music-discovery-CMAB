@@ -4,6 +4,8 @@ from datetime import date, datetime, timedelta
 from dataclasses import replace
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -13,7 +15,8 @@ from src.data.identity import resolve_artist_key, resolve_event_identity_keys
 from src.experiments.cli import _workspace_cache_directory
 from src.experiments.config import ExperimentConfig, TemporalProtocol
 from src.experiments.dataset import load_lastfm_tsv
-from src.experiments.runner import ExperimentRunner
+import src.experiments.runner as runner_module
+from src.experiments.runner import CheckpointError, ExperimentRunner
 from src.simulation.candidate_generator import CandidateGenerator, CandidatePools
 from src.simulation.scaler import FeatureScaler
 from src.simulation.simulator import iter_session_starts
@@ -163,8 +166,27 @@ class ExperimentConfigTests(unittest.TestCase):
 
 
 class ExperimentRunnerTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary_root = tempfile.TemporaryDirectory()
+        self._runner_index = 0
+
+    def tearDown(self):
+        self._temporary_root.cleanup()
+
     def make_runner(self, **overrides) -> ExperimentRunner:
-        return ExperimentRunner(tiny_events(), validation_config(**overrides))
+        index = self._runner_index
+        self._runner_index += 1
+        config = validation_config(
+            results_directory=str(Path(self._temporary_root.name) / "results"),
+            **overrides,
+        )
+        runner = ExperimentRunner(tiny_events(), config)
+        runner._test_checkpoint_directory = Path(self._temporary_root.name) / f"checkpoints-{index}"
+        return runner
+
+    def run_sweep(self, runner, checkpoint_directory=None):
+        directory = checkpoint_directory or runner._test_checkpoint_directory
+        return runner.run_validation_sweep(directory)
 
     def test_eligibility_is_computed_once_and_shared_across_policies(self):
         runner = self.make_runner()
@@ -172,7 +194,7 @@ class ExperimentRunnerTests(unittest.TestCase):
         self.assertEqual(runner.eligibility_counts["U1"]["train"], 3)
         self.assertEqual(runner.eligibility_counts["U1"]["validation_usable"], 2)
         self.assertEqual(runner.eligibility_counts["U1"]["test_usable"], 2)
-        runs = runner.run_validation_sweep()
+        runs = self.run_sweep(runner)
         self.assertTrue(all(run.eligible_users == runner.eligible_users for run in runs))
 
     def test_empty_pool_points_are_excluded_from_validation_and_test_usable_counts(self):
@@ -239,7 +261,7 @@ class ExperimentRunnerTests(unittest.TestCase):
 
     def test_five_policy_smoke_uses_shared_schedule_and_candidate_pool(self):
         runner = self.make_runner()
-        runs = runner.run_validation_sweep()
+        runs = self.run_sweep(runner)
         self.assertEqual({run.policy for run in runs}, {
             "random", "popularity", "greedy", "epsilon_greedy", "linucb"
         })
@@ -255,7 +277,8 @@ class ExperimentRunnerTests(unittest.TestCase):
             self.assertEqual(run.evaluation_phase, "validation")
 
     def test_alpha_and_epsilon_changes_do_not_change_candidate_pool(self):
-        runs = self.make_runner().run_validation_sweep()
+        runner = self.make_runner()
+        runs = self.run_sweep(runner)
         linucb = [run for run in runs if run.policy == "linucb"]
         epsilon = [run for run in runs if run.policy == "epsilon_greedy"]
         self.assertEqual(len({run.candidate_pool_digest for run in linucb}), 1)
@@ -273,7 +296,7 @@ class ExperimentRunnerTests(unittest.TestCase):
             return original_fit(scaler, contexts)
 
         with patch.object(FeatureScaler, "fit", new=counted_fit):
-            runs = runner.run_validation_sweep()
+            runs = self.run_sweep(runner)
 
         self.assertEqual(len(runs), 36)
         self.assertEqual(len(fitted_instances), 3)
@@ -321,8 +344,8 @@ class ExperimentRunnerTests(unittest.TestCase):
     def test_same_seed_reproduces_decisions_metrics_and_pool_digest(self):
         first_runner = self.make_runner()
         second_runner = self.make_runner()
-        first = first_runner.run_validation_sweep()
-        second = second_runner.run_validation_sweep()
+        first = self.run_sweep(first_runner)
+        second = self.run_sweep(second_runner)
         for left, right in zip(first, second):
             self.assertEqual(left.run_id, right.run_id)
             self.assertEqual(left.to_json_dict(first_runner.config)["decisions"],
@@ -332,7 +355,7 @@ class ExperimentRunnerTests(unittest.TestCase):
 
     def test_validation_sweep_spools_details_and_returns_compact_results(self):
         runner = self.make_runner(policies=("random",), candidate_pool_depths=(50, 100))
-        runs = runner.run_validation_sweep()
+        runs = self.run_sweep(runner)
         self.assertEqual(len(runs), 2)
         for run in runs:
             self.assertEqual(run.simulation.decisions, ())
@@ -349,7 +372,7 @@ class ExperimentRunnerTests(unittest.TestCase):
             for depth in runner.config.candidate_pool_depths
             for policy, params in runner._validation_policy_grid()
         )
-        bounded = runner.run_validation_sweep()
+        bounded = self.run_sweep(runner)
         self.assertEqual(len(reference), len(bounded))
         for full, compact in zip(reference, bounded):
             details = compact.to_json_dict(runner.config)
@@ -364,14 +387,14 @@ class ExperimentRunnerTests(unittest.TestCase):
 
     def test_validation_results_are_ranked_by_frozen_criterion(self):
         runner = self.make_runner()
-        runs = runner.run_validation_sweep()
+        runs = self.run_sweep(runner)
         ordered = runner.rank_validation_results(runs)
         self.assertEqual(len(ordered), len(runs))
         self.assertTrue(ordered)
 
     def test_result_writer_emits_flat_csv_and_detailed_jsonl(self):
         runner = self.make_runner(policies=("random",))
-        runs = runner.run_validation_sweep()
+        runs = self.run_sweep(runner)
         with tempfile.TemporaryDirectory() as directory:
             csv_path, jsonl_path = runner.write_results(runs, directory)
             row = json.loads(jsonl_path.read_text(encoding="utf-8"))
@@ -379,6 +402,258 @@ class ExperimentRunnerTests(unittest.TestCase):
             self.assertEqual(row["summary"]["evaluation_phase"], "validation")
             self.assertEqual(len(row["decisions"]), 4)
             self.assertTrue(row["candidate_pool_digest"])
+
+    def test_checkpoint_resume_matches_uninterrupted_sweep_exactly(self):
+        interrupted = self.make_runner()
+        checkpoint_directory = interrupted._test_checkpoint_directory
+        original_run_one = interrupted._run_one
+        calls = 0
+
+        def fail_after_one(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("simulated interruption")
+            return original_run_one(*args, **kwargs)
+
+        with patch.object(interrupted, "_run_one", side_effect=fail_after_one):
+            with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                self.run_sweep(interrupted)
+        self.assertEqual(len(tuple(checkpoint_directory.glob("*.checkpoint.json"))), 1)
+
+        resumed = self.make_runner()
+        original_fit = FeatureScaler.fit
+        fit_calls = []
+
+        def counted_fit(scaler, contexts):
+            fit_calls.append(scaler)
+            return original_fit(scaler, contexts)
+
+        with patch.object(FeatureScaler, "fit", new=counted_fit):
+            resumed_runs = self.run_sweep(resumed, checkpoint_directory)
+        reference = self.make_runner()
+        reference_runs = self.run_sweep(reference)
+
+        self.assertEqual(resumed.resumed_run_count, 1)
+        # One N-specific warm-up is reconstructed on restart, then reused by
+        # all remaining configurations at that depth.
+        self.assertEqual(len(fit_calls), 1)
+        self.assertEqual(len(resumed_runs), 12)
+        self.assertEqual(len({run.run_id for run in resumed_runs}), 12)
+        self.assertEqual(
+            [run.run_id for run in resumed_runs],
+            [run.run_id for run in reference_runs],
+        )
+        for resumed_run, reference_run in zip(resumed_runs, reference_runs):
+            self.assertEqual(resumed_run.metrics, reference_run.metrics)
+            self.assertEqual(resumed_run.candidate_pool_digest, reference_run.candidate_pool_digest)
+            self.assertEqual(resumed_run.scaler_digest, reference_run.scaler_digest)
+            self.assertEqual(
+                resumed_run.to_json_dict(resumed.config)["decisions"],
+                reference_run.to_json_dict(reference.config)["decisions"],
+            )
+        csv_path, jsonl_path = resumed.write_results(
+            resumed_runs, Path(self._temporary_root.name) / "aggregated"
+        )
+        self.assertEqual(len(csv_path.read_text(encoding="utf-8").splitlines()), 13)
+        self.assertEqual(len(jsonl_path.read_text(encoding="utf-8").splitlines()), 12)
+
+    def _make_single_checkpoint(self):
+        runner = self.make_runner(policies=("random",), candidate_pool_depths=(100,))
+        runs = self.run_sweep(runner)
+        self.assertEqual(len(runs), 1)
+        checkpoint = next(runner._test_checkpoint_directory.glob("*.checkpoint.json"))
+        detail = runner._test_checkpoint_directory / checkpoint.name.removesuffix(".checkpoint.json")
+        detail = detail.with_suffix(".jsonl")
+        return runner, checkpoint, detail
+
+    def test_incomplete_checkpoint_is_not_treated_as_completed(self):
+        runner, marker_path, _ = self._make_single_checkpoint()
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["completion_status"] = "writing"
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        resumed = self.make_runner(policies=("random",), candidate_pool_depths=(100,))
+        with self.assertRaisesRegex(CheckpointError, "not marked complete"):
+            self.run_sweep(resumed, runner._test_checkpoint_directory)
+
+    def test_corrupt_checkpoint_detail_is_not_reused(self):
+        runner, _, detail_path = self._make_single_checkpoint()
+        with detail_path.open("ab") as stream:
+            stream.write(b"corruption")
+        resumed = self.make_runner(policies=("random",), candidate_pool_depths=(100,))
+        with self.assertRaisesRegex(CheckpointError, "checksum mismatch"):
+            self.run_sweep(resumed, runner._test_checkpoint_directory)
+
+    def test_incompatible_checkpoint_is_not_reused(self):
+        runner, marker_path, _ = self._make_single_checkpoint()
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["identity"]["dataset_content_hash"] = "0" * 64
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        resumed = self.make_runner(policies=("random",), candidate_pool_depths=(100,))
+        with self.assertRaisesRegex(CheckpointError, "dataset_content_hash differs"):
+            self.run_sweep(resumed, runner._test_checkpoint_directory)
+
+    def test_marker_with_wrong_checksum_is_rejected(self):
+        runner, marker_path, _ = self._make_single_checkpoint()
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["result_sha256"] = "0" * 64
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        resumed = self.make_runner(policies=("random",), candidate_pool_depths=(100,))
+        with self.assertRaisesRegex(CheckpointError, "checksum mismatch"):
+            self.run_sweep(resumed, runner._test_checkpoint_directory)
+
+    def test_partial_jsonl_without_completion_marker_is_rejected(self):
+        runner = self.make_runner(policies=("random",))
+        checkpoint_directory = runner._test_checkpoint_directory
+        checkpoint_directory.mkdir(parents=True)
+        (checkpoint_directory / "unfinished.jsonl").write_text(
+            '{"summary":', encoding="utf-8"
+        )
+        resumed = self.make_runner(policies=("random",))
+        with self.assertRaisesRegex(CheckpointError, "no completion marker"):
+            self.run_sweep(resumed, checkpoint_directory)
+
+    def test_checkpoint_from_different_code_digest_is_rejected(self):
+        runner, marker_path, _ = self._make_single_checkpoint()
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["identity"]["experiment_code_digest"] = "0" * 64
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        resumed = self.make_runner(policies=("random",), candidate_pool_depths=(100,))
+        with self.assertRaisesRegex(CheckpointError, "experiment_code_digest differs"):
+            self.run_sweep(resumed, runner._test_checkpoint_directory)
+
+    def test_checkpoint_from_different_configuration_is_rejected(self):
+        runner, marker_path, _ = self._make_single_checkpoint()
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["identity"]["configuration_hash"] = "0" * 64
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        resumed = self.make_runner(policies=("random",), candidate_pool_depths=(100,))
+        with self.assertRaisesRegex(CheckpointError, "configuration_hash differs"):
+            self.run_sweep(resumed, runner._test_checkpoint_directory)
+
+    def test_completion_marker_follows_closed_detail_and_checksum(self):
+        runner = self.make_runner(policies=("random",))
+        events = []
+        detail_streams = []
+        original_atomic_write = runner_module._atomic_write
+        original_sha256_file = runner_module._sha256_file
+
+        def tracked_atomic_write(path, writer):
+            is_marker = path.name.endswith(".checkpoint.json")
+            if is_marker:
+                self.assertTrue(detail_streams[-1].closed)
+                self.assertTrue(path.with_name(path.name.removesuffix(".checkpoint.json") + ".jsonl").is_file())
+                events.append("marker")
+
+            def capture_stream(stream):
+                writer(stream)
+                if not is_marker:
+                    detail_streams.append(stream)
+
+            original_atomic_write(path, capture_stream)
+            if not is_marker:
+                events.append("detail-closed")
+
+        def tracked_sha256_file(path):
+            events.append("checksum")
+            return original_sha256_file(path)
+
+        with patch.object(runner_module, "_atomic_write", side_effect=tracked_atomic_write), patch.object(
+            runner_module, "_sha256_file", side_effect=tracked_sha256_file
+        ):
+            runs = self.run_sweep(runner)
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(events[:3], ["detail-closed", "checksum", "marker"])
+
+    def test_checkpoint_resume_across_independent_python_processes(self):
+        root = Path(self._temporary_root.name)
+        checkpoint_directory = root / "process-checkpoints"
+        resumed_output = root / "resumed-signature.json"
+        reference_output = root / "reference-signature.json"
+        worker = r'''import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd() / "tests"))
+from test_experiments import tiny_events, validation_config
+from src.experiments.runner import ExperimentRunner
+mode, checkpoint, output, root = sys.argv[1:]
+config = validation_config(results_directory=str(Path(root) / "results"))
+runner = ExperimentRunner(tiny_events(), config)
+if mode == "interrupt":
+    original = runner._run_one
+    calls = 0
+    def fail_after_one(*args, **kwargs):
+        global calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("intentional process boundary")
+        return original(*args, **kwargs)
+    runner._run_one = fail_after_one
+    try:
+        runner.run_validation_sweep(checkpoint)
+    except RuntimeError as error:
+        if str(error) != "intentional process boundary":
+            raise
+    else:
+        raise AssertionError("expected the first process to stop after one run")
+    if len(list(Path(checkpoint).glob("*.checkpoint.json"))) != 1:
+        raise AssertionError("first process did not persist exactly one checkpoint")
+elif mode in {"resume", "reference"}:
+    runs = runner.run_validation_sweep(checkpoint)
+    if mode == "resume" and runner.resumed_run_count != 1:
+        raise AssertionError("second process did not resume exactly one completed run")
+    signature = [
+        {
+            "run_id": run.run_id,
+            "metrics": dict(run.metrics),
+            "candidate_pool_digest": run.candidate_pool_digest,
+            "scaler_digest": run.scaler_digest,
+            "decisions": run.to_json_dict(config)["decisions"],
+        }
+        for run in runs
+    ]
+    Path(output).write_text(json.dumps(signature, sort_keys=True), encoding="utf-8")
+else:
+    raise AssertionError(mode)
+'''
+
+        def launch(mode, checkpoint, output=None):
+            args = [sys.executable, "-c", worker, mode, str(checkpoint), str(output or ""), str(root)]
+            return subprocess.run(
+                args, cwd=Path.cwd(), capture_output=True, text=True, check=True
+            )
+
+        launch("interrupt", checkpoint_directory)
+        marker_path = next(checkpoint_directory.glob("*.checkpoint.json"))
+        detail_path = checkpoint_directory / marker_path.name.removesuffix(".checkpoint.json")
+        detail_path = detail_path.with_suffix(".jsonl")
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        import hashlib
+        self.assertEqual(
+            hashlib.sha256(detail_path.read_bytes()).hexdigest(),
+            marker["result_sha256"],
+        )
+        launch("resume", checkpoint_directory, resumed_output)
+        launch("reference", root / "reference-checkpoints", reference_output)
+        self.assertEqual(
+            json.loads(resumed_output.read_text(encoding="utf-8")),
+            json.loads(reference_output.read_text(encoding="utf-8")),
+        )
+
+    def test_final_test_does_not_read_or_write_validation_checkpoints(self):
+        params = {
+            "random": {}, "popularity": {}, "greedy": {},
+            "epsilon_greedy": {"epsilon": 0.1}, "linucb": {"alpha": 0.25},
+        }
+        config = validation_config(
+            mode="final_test", final_parameters=params,
+            candidate_pool_depths=(100,), policies=tuple(params),
+            alpha_values=(0.25,), epsilon_values=(0.1,),
+            results_directory=str(Path(self._temporary_root.name) / "final-results"),
+        )
+        runner = ExperimentRunner(tiny_events(), config)
+        runner.run_final_test()
+        self.assertIsNone(runner.checkpoint_directory)
+        self.assertFalse(tuple(Path(self._temporary_root.name).rglob("*.checkpoint.json")))
 
     def test_final_test_is_a_separate_explicit_run(self):
         params = {
@@ -402,9 +677,18 @@ class ExperimentRunnerTests(unittest.TestCase):
 class ValidationSelectionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.config = validation_config(candidate_pool_depths=(50, 100, 200))
+        cls._temporary_root = tempfile.TemporaryDirectory()
+        cls.config = validation_config(
+            candidate_pool_depths=(50, 100, 200),
+            results_directory=str(Path(cls._temporary_root.name) / "results"),
+        )
         cls.runner = ExperimentRunner(tiny_events(), cls.config)
-        cls.runs = cls.runner.run_validation_sweep()
+        cls.checkpoint_directory = Path(cls._temporary_root.name) / "checkpoints"
+        cls.runs = cls.runner.run_validation_sweep(cls.checkpoint_directory)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._temporary_root.cleanup()
 
     def test_selection_uses_only_configured_alpha_and_epsilon_at_n100(self):
         selection = self.runner.select_validation_parameters(self.runs)
