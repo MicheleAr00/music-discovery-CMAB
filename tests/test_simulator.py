@@ -86,6 +86,124 @@ def prepare_default_warmup(simulator: SequentialOfflineBanditSimulator):
 
 
 class SequentialSimulatorTest(unittest.TestCase):
+    def test_precomputed_warmup_restores_equivalent_state_and_contexts(self) -> None:
+        source = make_events()
+        start = BASE - timedelta(seconds=1)
+        end = BASE + timedelta(days=1)
+
+        reference = build_simulator(source)
+        reference_warmup = reference.prepare_warmup(start, end)
+
+        restored = build_simulator(source)
+        with (
+            patch("src.simulation.simulator.iter_session_starts", side_effect=AssertionError),
+            patch.object(restored._candidate_generator, "generate", side_effect=AssertionError),
+            patch.object(restored._context_builder, "build", side_effect=AssertionError),
+        ):
+            restored_warmup = restored.prepare_warmup_from_precomputed(
+                start,
+                end,
+                scaler_mean=reference.scaler.mean_,
+                scaler_scale=reference.scaler.scale_,
+                expected=reference_warmup,
+            )
+
+        self.assertEqual(reference_warmup, restored_warmup)
+        self.assertIsNot(reference.state, restored.state)
+        self.assertIsNot(reference.scaler, restored.scaler)
+        self.assertIsNot(reference.scaler.mean_, restored.scaler.mean_)
+        self.assertIsNot(reference.scaler.scale_, restored.scaler.scale_)
+        self.assertEqual(reference.scaler.mean_, restored.scaler.mean_)
+        self.assertEqual(reference.scaler.scale_, restored.scaler.scale_)
+        self.assertEqual(reference.state.current_time, restored.state.current_time)
+        self.assertEqual(
+            reference.state.processed_event_count,
+            restored.state.processed_event_count,
+        )
+        item_keys = {row.item_key for row in source}
+        artist_keys = {row.artist_key for row in source}
+        for user_id in {row.user_id for row in source}:
+            self.assertEqual(
+                reference.state.get_user_event_count(user_id),
+                restored.state.get_user_event_count(user_id),
+            )
+            for item_key in item_keys:
+                self.assertEqual(
+                    reference.state.get_user_item_count(user_id, item_key),
+                    restored.state.get_user_item_count(user_id, item_key),
+                )
+                self.assertEqual(
+                    reference.state.get_user_track_last_timestamp(user_id, item_key),
+                    restored.state.get_user_track_last_timestamp(user_id, item_key),
+                )
+                self.assertEqual(
+                    reference.state.get_item_play_count(item_key),
+                    restored.state.get_item_play_count(item_key),
+                )
+                self.assertEqual(
+                    reference.state.get_item_user_count(item_key),
+                    restored.state.get_item_user_count(item_key),
+                )
+                self.assertEqual(
+                    reference.state.get_item_first_timestamp(item_key),
+                    restored.state.get_item_first_timestamp(item_key),
+                )
+            for artist_key in artist_keys:
+                self.assertEqual(
+                    reference.state.get_user_artist_count(user_id, artist_key),
+                    restored.state.get_user_artist_count(user_id, artist_key),
+                )
+                self.assertEqual(
+                    reference.state.get_user_artist_last_timestamp(user_id, artist_key),
+                    restored.state.get_user_artist_last_timestamp(user_id, artist_key),
+                )
+                self.assertEqual(
+                    reference.state.get_artist_play_count(artist_key),
+                    restored.state.get_artist_play_count(artist_key),
+                )
+                self.assertEqual(
+                    reference.state.get_artist_user_count(artist_key),
+                    restored.state.get_artist_user_count(artist_key),
+                )
+
+        # Both simultaneous session starts at validation time remain excluded
+        # until their decision block has completed in the phase runner.
+        reference.state.advance_to(VALIDATION_START)
+        restored.state.advance_to(VALIDATION_START)
+        simultaneous_u1_item = next(
+            row.item_key for row in source
+            if row.timestamp == VALIDATION_START and row.user_id == "U1"
+        )
+        for simulator in (reference, restored):
+            self.assertEqual(
+                simulator.state.get_user_item_count("U1", simultaneous_u1_item),
+                0,
+            )
+        reference_generator = reference._candidate_generator
+        restored_generator = restored._candidate_generator
+        self.assertIsNot(reference_generator, restored_generator)
+        for user_id in ("U1", "U2"):
+            reference_pools = reference_generator.generate(user_id, VALIDATION_START, 50)
+            restored_pools = restored_generator.generate(user_id, VALIDATION_START, 50)
+            self.assertEqual(reference_pools, restored_pools)
+            self.assertEqual(
+                tuple(candidate.sources for candidate in reference_pools.candidates),
+                tuple(candidate.sources for candidate in restored_pools.candidates),
+            )
+            reference_raw = tuple(
+                ContextBuilder(reference.state).build(user_id, candidate, VALIDATION_START)
+                for candidate in reference_pools.candidates
+            )
+            restored_raw = tuple(
+                ContextBuilder(restored.state).build(user_id, candidate, VALIDATION_START)
+                for candidate in restored_pools.candidates
+            )
+            self.assertEqual(reference_raw, restored_raw)
+            self.assertEqual(
+                reference.scaler.transform(reference_raw),
+                restored.scaler.transform(restored_raw),
+            )
+
     def test_sessionization_gap_threshold_is_strictly_greater_than_ten_minutes(self) -> None:
         times = [
             BASE,

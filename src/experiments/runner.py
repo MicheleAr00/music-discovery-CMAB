@@ -178,6 +178,22 @@ class ValidationSelection:
         object.__setattr__(self, "selected_run_ids", MappingProxyType(dict(self.selected_run_ids)))
 
 
+@dataclass(frozen=True, slots=True)
+class _WarmupArtifact:
+    """In-memory, depth-specific scaler parameters and warm-up provenance."""
+
+    configuration_hash: str
+    dataset_content_hash: str
+    candidate_pool_depth: int
+    warmup_start: datetime
+    warmup_end: datetime
+    session_gap: timedelta
+    result: WarmupResult
+    scaler_mean: tuple[float, ...]
+    scaler_scale: tuple[float, ...]
+    scaler_digest: str
+
+
 def _decision_to_dict(record: DecisionRecord) -> dict[str, Any]:
     return {
         "phase": record.phase,
@@ -275,6 +291,9 @@ class ExperimentRunner:
             reward_calculator=self._reward_calculator,
         )
         self._final_test_completed = False
+        # Validation reuses only immutable warm-up artifacts, one per N. Each
+        # run still owns fresh state, candidate index, scaler, and policy.
+        self._warmup_artifacts: dict[int, _WarmupArtifact] = {}
         # Detailed validation decisions are spooled per run. Keeping the
         # TemporaryDirectory alive on the runner preserves write_results()
         # while allowing each heavy SimulationResult to be released at once.
@@ -371,7 +390,10 @@ class ExperimentRunner:
         try:
             for depth in self.config.candidate_pool_depths:
                 for policy_name, params in self._validation_policy_grid():
-                    full_run = self._run_one("validation", policy_name, params, depth)
+                    full_run = self._run_one(
+                        "validation", policy_name, params, depth,
+                        warmup_artifact=self._warmup_artifacts.get(depth),
+                    )
                     signatures = (full_run.candidate_pool_digest, full_run.scaler_digest)
                     previous = pool_traces.setdefault(depth, signatures)
                     if previous != signatures:
@@ -589,7 +611,13 @@ class ExperimentRunner:
         return LinUCBPolicy(LinUCB(alpha=float(params["alpha"])))
 
     def _run_one(
-        self, phase: str, policy_name: str, params: Mapping[str, Any], depth: int
+        self,
+        phase: str,
+        policy_name: str,
+        params: Mapping[str, Any],
+        depth: int,
+        *,
+        warmup_artifact: Optional[_WarmupArtifact] = None,
     ) -> ExperimentRun:
         started = perf_counter()
         state = TemporalState(self.events)
@@ -611,13 +639,38 @@ class ExperimentRunner:
             reward_horizon=self.config.temporal.reward_horizon,
         )
         warm_start, warm_end = self.config.temporal.warmup_bounds
-        warmup = simulator.prepare_warmup(warm_start, warm_end)
-        scaler_digest = hashlib.sha256(
-            json.dumps(
-                (simulator.scaler.mean_, simulator.scaler.scale_),
-                separators=(",", ":"),
-            ).encode("ascii")
-        ).hexdigest()
+        if warmup_artifact is None:
+            warmup = simulator.prepare_warmup(warm_start, warm_end)
+            scaler_mean = tuple(simulator.scaler.mean_)
+            scaler_scale = tuple(simulator.scaler.scale_)
+            scaler_digest = self._scaler_digest(scaler_mean, scaler_scale)
+            if phase == "validation":
+                self._warmup_artifacts[depth] = _WarmupArtifact(
+                    configuration_hash=self.config.configuration_hash,
+                    dataset_content_hash=self.dataset_content_hash,
+                    candidate_pool_depth=depth,
+                    warmup_start=warm_start,
+                    warmup_end=warm_end,
+                    session_gap=self.config.temporal.session_gap,
+                    result=warmup,
+                    scaler_mean=scaler_mean,
+                    scaler_scale=scaler_scale,
+                    scaler_digest=scaler_digest,
+                )
+        else:
+            self._validate_warmup_artifact(warmup_artifact, depth, warm_start, warm_end)
+            warmup = simulator.prepare_warmup_from_precomputed(
+                warm_start,
+                warm_end,
+                scaler_mean=warmup_artifact.scaler_mean,
+                scaler_scale=warmup_artifact.scaler_scale,
+                expected=warmup_artifact.result,
+            )
+            scaler_digest = self._scaler_digest(
+                simulator.scaler.mean_, simulator.scaler.scale_
+            )
+            if scaler_digest != warmup_artifact.scaler_digest:
+                raise RuntimeError("imported warm-up scaler digest differs from its artifact")
         recording_generator.start_recording()
         if phase == "validation":
             start, end = self.config.temporal.validation_bounds
@@ -675,6 +728,44 @@ class ExperimentRunner:
             candidate_pool_digest=recording_generator.digest,
             scaler_digest=scaler_digest,
         )
+
+    @staticmethod
+    def _scaler_digest(
+        mean: Sequence[float], scale: Sequence[float]
+    ) -> str:
+        return hashlib.sha256(
+            json.dumps((tuple(mean), tuple(scale)), separators=(",", ":"))
+            .encode("ascii")
+        ).hexdigest()
+
+    def _validate_warmup_artifact(
+        self,
+        artifact: _WarmupArtifact,
+        depth: int,
+        warm_start: datetime,
+        warm_end: datetime,
+    ) -> None:
+        """Reject in-memory artifacts from any different run provenance."""
+        expected = (
+            self.config.configuration_hash,
+            self.dataset_content_hash,
+            depth,
+            warm_start,
+            warm_end,
+            self.config.temporal.session_gap,
+        )
+        observed = (
+            artifact.configuration_hash,
+            artifact.dataset_content_hash,
+            artifact.candidate_pool_depth,
+            artifact.warmup_start,
+            artifact.warmup_end,
+            artifact.session_gap,
+        )
+        if observed != expected:
+            raise ValueError("warm-up artifact provenance does not match this configuration")
+        if self._scaler_digest(artifact.scaler_mean, artifact.scaler_scale) != artifact.scaler_digest:
+            raise ValueError("warm-up artifact scaler parameters do not match their digest")
 
     def rank_validation_results(
         self,

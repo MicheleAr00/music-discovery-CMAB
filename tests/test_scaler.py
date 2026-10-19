@@ -105,6 +105,33 @@ class FeatureScalerTest(unittest.TestCase):
         self.assertEqual(first.scale_, second.scale_)
         self.assertEqual(first.transform(row(3)), second.transform(row(3)))
 
+    def test_imported_parameters_are_exact_and_owned_by_new_scaler(self) -> None:
+        fitted = FeatureScaler().fit((row(0), row(2), row(4)))
+        imported = FeatureScaler().import_fitted_parameters(
+            fitted.mean_, fitted.scale_
+        )
+
+        self.assertEqual(imported.mean_, fitted.mean_)
+        self.assertEqual(imported.scale_, fitted.scale_)
+        self.assertIsNot(imported.mean_, fitted.mean_)
+        self.assertIsNot(imported.scale_, fitted.scale_)
+        self.assertEqual(
+            imported.transform(row(3)), fitted.transform(row(3))
+        )
+        with self.assertRaisesRegex(RuntimeError, "already fitted"):
+            imported.import_fitted_parameters(fitted.mean_, fitted.scale_)
+
+    def test_imported_parameters_reject_invalid_or_changed_novelty_parameters(self) -> None:
+        fitted = FeatureScaler().fit((row(0), row(2)))
+        bad_mean = list(fitted.mean_)
+        bad_mean[13] = 1.0
+        with self.assertRaisesRegex(ValueError, "novelty feature parameters"):
+            FeatureScaler().import_fitted_parameters(bad_mean, fitted.scale_)
+        bad_scale = list(fitted.scale_)
+        bad_scale[0] = 0.0
+        with self.assertRaisesRegex(ValueError, "positive"):
+            FeatureScaler().import_fitted_parameters(fitted.mean_, bad_scale)
+
     def test_invalid_feature_counts_raise_clear_errors(self) -> None:
         scaler = FeatureScaler().fit(row(0))
         with self.assertRaisesRegex(ValueError, "exactly 15"):

@@ -136,6 +136,40 @@ class FeatureScaler:
         self._scale = tuple(scales + [1.0, 1.0])
         return self
 
+    def import_fitted_parameters(
+        self,
+        mean: Iterable[Real],
+        scale: Iterable[Real],
+    ) -> FeatureScaler:
+        """Install an independently copied set of already fitted parameters.
+
+        This is for the experiment runner's in-memory warm-up reuse: the
+        source scaler was fitted on the exact warm-up context sequence for
+        the same candidate-pool depth. No statistics are recomputed here.
+        """
+        if self.is_fitted:
+            raise RuntimeError(
+                "FeatureScaler is already fitted; create a new instance to import parameters"
+            )
+        try:
+            copied_mean = tuple(float(value) for value in mean)
+            copied_scale = tuple(float(value) for value in scale)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("scaler parameters must be numeric sequences") from exc
+        if len(copied_mean) != FEATURE_COUNT or len(copied_scale) != FEATURE_COUNT:
+            raise ValueError(
+                f"scaler parameters must each contain exactly {FEATURE_COUNT} values"
+            )
+        if not all(math.isfinite(value) for value in copied_mean + copied_scale):
+            raise ValueError("scaler parameters must all be finite")
+        if any(value <= 0.0 for value in copied_scale):
+            raise ValueError("scaler scales must be positive")
+        if copied_mean[13:] != (0.0, 0.0) or copied_scale[13:] != (1.0, 1.0):
+            raise ValueError("novelty feature parameters must remain mean=0 and scale=1")
+        self._mean = copied_mean
+        self._scale = copied_scale
+        return self
+
     def transform(self, contexts: ContextInput) -> ContextOutput:
         """Transform one context or a batch using fixed warm-up parameters."""
         self._require_fitted()

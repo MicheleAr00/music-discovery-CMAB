@@ -380,6 +380,56 @@ class SequentialOfflineBanditSimulator:
             state_events_processed=self._state.processed_event_count,
         )
 
+    def prepare_warmup_from_precomputed(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        scaler_mean: Sequence[float],
+        scaler_scale: Sequence[float],
+        expected: WarmupResult,
+    ) -> WarmupResult:
+        """Reuse fitted warm-up parameters and restore a fresh temporal state.
+
+        The caller must provide parameters fitted by :meth:`prepare_warmup`
+        over the exact same ordered events, pool depth, and warm-up bounds.
+        This method does not sessionize, generate candidate pools, build
+        contexts, or refit the scaler. It advances a fresh ``TemporalState``
+        once to the same exclusive boundary reached by the reference warm-up;
+        its event listener therefore populates a fresh candidate index in
+        original event order. The processed-event count is checked against the
+        reference summary before the simulator is marked ready for a phase.
+        """
+        if self._warmup_prepared:
+            raise RuntimeError("warm-up has already been prepared")
+        if self._scaler.is_fitted:
+            raise RuntimeError(
+                "precomputed warm-up requires an unfitted FeatureScaler"
+            )
+        if not isinstance(start, datetime) or not isinstance(end, datetime) or end < start:
+            raise ValueError("warm-up bounds must be valid datetimes with end >= start")
+        if self._state.current_time is not None or self._state.processed_event_count != 0:
+            raise ValueError("precomputed warm-up requires a fresh TemporalState")
+        if not isinstance(expected, WarmupResult):
+            raise TypeError("expected must be a WarmupResult from reference warm-up")
+        if min(expected.decision_points, expected.context_rows, expected.state_events_processed) < 0:
+            raise ValueError("warm-up summary counts cannot be negative")
+
+        self._scaler.import_fitted_parameters(scaler_mean, scaler_scale)
+        self._state.advance_to(self._after_inclusive_time(end))
+        actual_events = self._state.processed_event_count
+        if actual_events != expected.state_events_processed:
+            raise RuntimeError(
+                "precomputed warm-up provenance mismatch: consumed "
+                f"{actual_events} events, expected {expected.state_events_processed}"
+            )
+        self._warmup_prepared = True
+        return WarmupResult(
+            decision_points=expected.decision_points,
+            context_rows=expected.context_rows,
+            state_events_processed=actual_events,
+        )
+
     def _process_pending(self, timestamp: datetime) -> int:
         current_us = self._time_key(timestamp)
         applied = 0

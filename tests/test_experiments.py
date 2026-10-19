@@ -15,6 +15,7 @@ from src.experiments.config import ExperimentConfig, TemporalProtocol
 from src.experiments.dataset import load_lastfm_tsv
 from src.experiments.runner import ExperimentRunner
 from src.simulation.candidate_generator import CandidateGenerator, CandidatePools
+from src.simulation.scaler import FeatureScaler
 from src.simulation.simulator import iter_session_starts
 
 
@@ -259,6 +260,63 @@ class ExperimentRunnerTests(unittest.TestCase):
         epsilon = [run for run in runs if run.policy == "epsilon_greedy"]
         self.assertEqual(len({run.candidate_pool_digest for run in linucb}), 1)
         self.assertEqual(len({run.candidate_pool_digest for run in epsilon}), 1)
+
+    def test_validation_fits_scaler_exactly_once_per_candidate_depth(self):
+        runner = self.make_runner(
+            candidate_pool_depths=(50, 100, 200),
+        )
+        original_fit = FeatureScaler.fit
+        fitted_instances = []
+
+        def counted_fit(scaler, contexts):
+            fitted_instances.append(scaler)
+            return original_fit(scaler, contexts)
+
+        with patch.object(FeatureScaler, "fit", new=counted_fit):
+            runs = runner.run_validation_sweep()
+
+        self.assertEqual(len(runs), 36)
+        self.assertEqual(len(fitted_instances), 3)
+        self.assertEqual(set(runner._warmup_artifacts), {50, 100, 200})
+        self.assertEqual(len({id(scaler) for scaler in fitted_instances}), 3)
+        for depth in (50, 100, 200):
+            depth_runs = [run for run in runs if run.candidate_pool_depth == depth]
+            self.assertEqual(len({run.scaler_digest for run in depth_runs}), 1)
+
+    def test_cached_warmup_matches_reference_for_every_policy(self):
+        runner = self.make_runner(
+            candidate_pool_depths=(50, 100),
+            policies=("random", "popularity", "greedy", "epsilon_greedy", "linucb"),
+        )
+        for policy_name, params in runner._validation_policy_grid():
+            with self.subTest(policy=policy_name, parameters=params):
+                reference = runner._run_one(
+                    "validation", policy_name, params, 50
+                )
+                artifact = runner._warmup_artifacts[50]
+                optimized = runner._run_one(
+                    "validation", policy_name, params, 50,
+                    warmup_artifact=artifact,
+                )
+
+                self.assertEqual(reference.warmup, optimized.warmup)
+                self.assertEqual(reference.scaler_digest, optimized.scaler_digest)
+                self.assertEqual(reference.candidate_pool_digest, optimized.candidate_pool_digest)
+                self.assertEqual(reference.simulation.decisions, optimized.simulation.decisions)
+                self.assertEqual(reference.simulation.feedback_scheduled, optimized.simulation.feedback_scheduled)
+                self.assertEqual(reference.simulation.feedback_applied, optimized.simulation.feedback_applied)
+                self.assertEqual(reference.simulation.feedback_pending_at_end, optimized.simulation.feedback_pending_at_end)
+                self.assertEqual(reference.metrics, optimized.metrics)
+
+    def test_warmup_artifact_cannot_be_reused_at_another_depth(self):
+        runner = self.make_runner(candidate_pool_depths=(50, 100))
+        runner._run_one("validation", "random", {}, 50)
+        artifact = runner._warmup_artifacts[50]
+        with self.assertRaisesRegex(ValueError, "provenance"):
+            runner._run_one(
+                "validation", "random", {}, 100,
+                warmup_artifact=artifact,
+            )
 
     def test_same_seed_reproduces_decisions_metrics_and_pool_digest(self):
         first_runner = self.make_runner()
