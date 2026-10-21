@@ -113,7 +113,7 @@
   "final_test_config_file_sha256": "76e59cefb025579b84f75f4e691387059e76b11b4a08b1c778109c1dabaad40c",
   "final_test_runner_source_digest": "d6ddc18d028ddacda7339ca1dae5ee08ea7d7722e416aeb8793e4f8d2dcf3e44",
   "selection_frozen_date": "2026-10-21",
-  "runner_preparation_commit": null,
-  "runner_preparation_note": "The runner preparation commit is recorded in this manifest. Its final reference and manifest checksum are finalized in a follow-up metadata commit to avoid a self-referential Git commit hash.",
-  "manifest_sha256": "a317eefb77a9cd8495c2edce462b65346dda4e65db16045bdf03acfe0234d621"
+  "runner_preparation_commit": "341f047a502778c0ea19decd5df8bf68f0f89297",
+  "runner_preparation_note": "This identifies the runner implementation and frozen selection artifacts. The manifest reference and its self-checksum are finalized in the following metadata-only commit, avoiding a self-referential Git commit hash.",
+  "manifest_sha256": "93086553c6929c3a0c571a8c1c004744178b701e91b1c88a5038d536c4a21fdd"
 }
