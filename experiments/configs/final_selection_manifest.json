@@ -1,0 +1,119 @@
+{
+  "manifest_schema": "music-discovery-cmab-selection-v1",
+  "selection_status": "frozen_before_held_out_test",
+  "protocol_commit": "c7167312f55fdacd86e4183bfd80a3d1b02d5b55",
+  "experiment_commit": "f67c7d9bdf2dfa24de0fe14221adb41c6f1e33a8",
+  "dataset_id": "lastfm-dataset-1K",
+  "dataset_content_hash": "5b076e7a1cb3646f58499d53976630528ecd9ac1a2431cb9f8c919a768c7a04a",
+  "validation_config_hash": "ea8616724509edd297d13b5c83a38b14bb758d3148323a51fe123d997ec835f6",
+  "final_test_config_hash": "044f9269d4e3820b8a2ff3e23bd6e191878ccfc421bc6532ac8f5d2ab15b983b",
+  "primary_candidate_pool_depth": 100,
+  "sensitivity_depths_not_used_for_selection": [
+    50,
+    200
+  ],
+  "k_values": [
+    5,
+    10,
+    20
+  ],
+  "seed": 42,
+  "random_seed": 42,
+  "temporal_protocol": {
+    "warmup_start": "2005-10-30",
+    "warmup_end": "2008-12-31",
+    "validation_start": "2009-01-01",
+    "validation_end": "2009-02-28",
+    "test_start": "2009-03-01",
+    "test_end": "2009-05-05",
+    "session_gap_minutes": 10,
+    "reward_horizon_days": 7,
+    "n_train_unit": "events"
+  },
+  "selection_rule": {
+    "source_phase": "validation_only",
+    "primary_pool_depth": 100,
+    "primary_metric": "ndcg@10",
+    "tie_breakers": [
+      "higher_average_reward",
+      "lower_hyperparameter_value"
+    ],
+    "test_metrics_used_for_selection": false
+  },
+  "selected_validation_runs": {
+    "random": {
+      "run_id": "68ee5a6012e54aef",
+      "parameters": {
+        "random_seed": 42
+      }
+    },
+    "popularity": {
+      "run_id": "d1b463f44b968420",
+      "parameters": {}
+    },
+    "greedy": {
+      "run_id": "4ee1c7cd8ab862b1",
+      "parameters": {}
+    },
+    "epsilon_greedy": {
+      "run_id": "93648fba05cb426d",
+      "parameters": {
+        "epsilon": 0.05,
+        "random_seed": 42
+      }
+    },
+    "linucb": {
+      "run_id": "f699daa9d589645c",
+      "parameters": {
+        "alpha": 2.0
+      }
+    }
+  },
+  "final_parameters": {
+    "random": {
+      "random_seed": 42
+    },
+    "popularity": {},
+    "greedy": {},
+    "epsilon_greedy": {
+      "epsilon": 0.05,
+      "random_seed": 42
+    },
+    "linucb": {
+      "alpha": 2.0
+    }
+  },
+  "validation_scores_at_n100": {
+    "random": {
+      "ndcg@10": 0.0661183531084708,
+      "average_reward": 0.09729531950711003
+    },
+    "popularity": {
+      "ndcg@10": 0.041145232775353445,
+      "average_reward": 0.30859720219331993
+    },
+    "greedy": {
+      "ndcg@10": 0.27642688968897994,
+      "average_reward": 1.0605601566187033
+    },
+    "epsilon_greedy": {
+      "ndcg@10": 0.26598745450822847,
+      "average_reward": 1.0124954439570075
+    },
+    "linucb": {
+      "ndcg@10": 0.28563985922135376,
+      "average_reward": 1.0037040337436212
+    }
+  },
+  "final_test_config_file": "experiments/configs/final_test.json",
+  "validation_results": {
+    "aggregate_csv": "experiments/results/validation/ea8616724509-5b076e7a/runs.csv",
+    "aggregate_csv_sha256": "60a08c3da9f51b3818061f915b2302d81359f642daa8ec9a9474e93d9cb49b5d"
+  },
+  "final_test_config_file_sha256": "76e59cefb025579b84f75f4e691387059e76b11b4a08b1c778109c1dabaad40c",
+  "final_test_runner_source_digest": "d6ddc18d028ddacda7339ca1dae5ee08ea7d7722e416aeb8793e4f8d2dcf3e44",
+  "selection_frozen_date": "2026-10-21",
+  "runner_preparation_commit": null,
+  "runner_preparation_note": "The runner preparation commit is recorded in this manifest. Its final reference and manifest checksum are finalized in a follow-up metadata commit to avoid a self-referential Git commit hash.",
+  "manifest_sha256": "a317eefb77a9cd8495c2edce462b65346dda4e65db16045bdf03acfe0234d621"
+}

@@ -3,11 +3,13 @@
 from datetime import date, datetime, timedelta
 from dataclasses import replace
 import json
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
 from unittest.mock import MagicMock, patch
 
 from src.data.state import PlayEvent
@@ -16,7 +18,7 @@ from src.experiments.cli import _workspace_cache_directory
 from src.experiments.config import ExperimentConfig, TemporalProtocol
 from src.experiments.dataset import load_lastfm_tsv
 import src.experiments.runner as runner_module
-from src.experiments.runner import CheckpointError, ExperimentRunner
+from src.experiments.runner import CheckpointError, ExperimentRunner, _experiment_code_digest
 from src.simulation.candidate_generator import CandidateGenerator, CandidatePools
 from src.simulation.scaler import FeatureScaler
 from src.simulation.simulator import iter_session_starts
@@ -651,9 +653,21 @@ else:
             results_directory=str(Path(self._temporary_root.name) / "final-results"),
         )
         runner = ExperimentRunner(tiny_events(), config)
-        runner.run_final_test()
-        self.assertIsNone(runner.checkpoint_directory)
-        self.assertFalse(tuple(Path(self._temporary_root.name).rglob("*.checkpoint.json")))
+        checkpoint_directory = Path(self._temporary_root.name) / "final-checkpoints"
+        runs = runner.run_final_test(checkpoint_directory)
+        self.assertEqual(len(runs), 5)
+        self.assertEqual(runner.checkpoint_directory, checkpoint_directory.resolve())
+        markers = tuple(checkpoint_directory.glob("*.checkpoint.json"))
+        self.assertEqual(len(markers), 5)
+        for marker in markers:
+            record = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual(record["identity"]["evaluation_phase"], "test")
+            detail = checkpoint_directory / record["result_filename"]
+            self.assertEqual(
+                hashlib.sha256(detail.read_bytes()).hexdigest(), record["result_sha256"]
+            )
+        self.assertEqual(len(tuple(checkpoint_directory.glob("warmup-N100.json"))), 1)
+        self.assertFalse(tuple(Path(self._temporary_root.name).glob("validation-checkpoints/*.checkpoint.json")))
 
     def test_final_test_is_a_separate_explicit_run(self):
         params = {
@@ -664,6 +678,7 @@ else:
             mode="final_test", final_parameters=params,
             candidate_pool_depths=(100,),
             policies=tuple(params), alpha_values=(0.25,), epsilon_values=(0.1,),
+            results_directory=str(Path(self._temporary_root.name) / "explicit-final-results"),
         )
         runner = ExperimentRunner(tiny_events(), config)
         runs = runner.run_final_test()
@@ -672,6 +687,217 @@ else:
         self.assertEqual(len({run.candidate_pool_digest for run in runs}), 1)
         with self.assertRaisesRegex(RuntimeError, "already run"):
             runner.run_final_test()
+
+    def test_final_test_warmup_reuse_is_equivalent_to_original_path(self):
+        params = {
+            "random": {"random_seed": 42}, "popularity": {}, "greedy": {},
+            "epsilon_greedy": {"epsilon": 0.05, "random_seed": 42},
+            "linucb": {"alpha": 2.0},
+        }
+        config = validation_config(
+            mode="final_test", final_parameters=params, candidate_pool_depths=(100,),
+            results_directory=str(Path(self._temporary_root.name) / "final-results"),
+        )
+        reference_runner = ExperimentRunner(tiny_events(), config)
+        reference = tuple(
+            reference_runner._run_one("test", name, parameters, 100)
+            for name, parameters in params.items()
+        )
+        optimized_runner = ExperimentRunner(tiny_events(), config)
+        full_runs = []
+        original_compactor = ExperimentRunner._compact_checkpoint_run
+        def capture_before_compaction(run, path):
+            full_runs.append(run)
+            return original_compactor(run, path)
+        with patch.object(
+            optimized_runner, "_build_warmup_artifact",
+            wraps=optimized_runner._build_warmup_artifact,
+        ) as warmup_fit, patch.object(
+            optimized_runner, "_compact_checkpoint_run", side_effect=capture_before_compaction
+        ):
+            optimized = optimized_runner.run_final_test(
+                Path(self._temporary_root.name) / "equivalence-checkpoints"
+            )
+        warmup_fit.assert_called_once_with(100)
+        self.assertEqual(len(optimized), 5)
+        for original, reused in zip(reference, full_runs):
+            self.assertEqual(original.scaler_digest, reused.scaler_digest)
+            self.assertEqual(original.candidate_pool_digest, reused.candidate_pool_digest)
+            self.assertEqual(dict(original.metrics), dict(reused.metrics))
+            self.assertEqual(original.warmup, reused.warmup)
+            self.assertEqual(original.simulation.decisions, reused.simulation.decisions)
+            self.assertEqual(
+                original.simulation.feedback_scheduled,
+                reused.simulation.feedback_scheduled,
+            )
+            self.assertEqual(
+                original.simulation.feedback_applied,
+                reused.simulation.feedback_applied,
+            )
+
+    def test_final_test_resume_skips_verified_runs_without_duplicates(self):
+        params = {
+            "random": {"random_seed": 42}, "popularity": {}, "greedy": {},
+            "epsilon_greedy": {"epsilon": 0.05, "random_seed": 42},
+            "linucb": {"alpha": 2.0},
+        }
+        config = validation_config(
+            mode="final_test", final_parameters=params, candidate_pool_depths=(100,),
+            results_directory=str(Path(self._temporary_root.name) / "final-results"),
+        )
+        checkpoint_directory = Path(self._temporary_root.name) / "resume-final"
+        first = ExperimentRunner(tiny_events(), config)
+        completed = first.run_final_test(checkpoint_directory)
+        self.assertEqual(len(tuple(checkpoint_directory.glob("*.checkpoint.json"))), 5)
+        resumed = ExperimentRunner(tiny_events(), config)
+        with patch.object(resumed, "_build_warmup_artifact") as rebuild, patch.object(
+            resumed, "_run_one"
+        ) as rerun:
+            restored = resumed.run_final_test(checkpoint_directory)
+        rebuild.assert_not_called()
+        rerun.assert_not_called()
+        self.assertEqual(resumed.resumed_run_count, 5)
+        self.assertEqual([run.run_id for run in completed], [run.run_id for run in restored])
+        for before, after in zip(completed, restored):
+            self.assertEqual(dict(before.metrics), dict(after.metrics))
+            self.assertEqual(before.candidate_pool_digest, after.candidate_pool_digest)
+            self.assertEqual(before.scaler_digest, after.scaler_digest)
+            self.assertEqual(Path(before.details_path).read_bytes(), Path(after.details_path).read_bytes())
+        self.assertEqual(len({run.run_id for run in restored}), 5)
+
+    def test_final_test_resumes_after_one_completed_configuration(self):
+        params = {
+            "random": {"random_seed": 42}, "popularity": {}, "greedy": {},
+            "epsilon_greedy": {"epsilon": 0.05, "random_seed": 42},
+            "linucb": {"alpha": 2.0},
+        }
+        config = validation_config(
+            mode="final_test", final_parameters=params, candidate_pool_depths=(100,),
+            results_directory=str(Path(self._temporary_root.name) / "final-results"),
+        )
+        checkpoint_directory = Path(self._temporary_root.name) / "interrupted-final"
+        interrupted = ExperimentRunner(tiny_events(), config)
+        real_run_one = interrupted._run_one
+        calls = 0
+        def fail_after_first(phase, policy_name, policy_parameters, depth, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("simulated interruption after first checkpoint")
+            return real_run_one(phase, policy_name, policy_parameters, depth, **kwargs)
+        with patch.object(interrupted, "_run_one", side_effect=fail_after_first):
+            with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                interrupted.run_final_test(checkpoint_directory)
+        self.assertEqual(len(tuple(checkpoint_directory.glob("*.checkpoint.json"))), 1)
+
+        resumed = ExperimentRunner(tiny_events(), config)
+        runs = resumed.run_final_test(checkpoint_directory)
+        self.assertEqual(resumed.resumed_run_count, 1)
+        self.assertEqual(len(runs), 5)
+        self.assertEqual(len({run.run_id for run in runs}), 5)
+        self.assertEqual(len(tuple(checkpoint_directory.glob("*.checkpoint.json"))), 5)
+
+        reference = ExperimentRunner(tiny_events(), config)
+        reference_runs = reference.run_final_test(
+            Path(self._temporary_root.name) / "uninterrupted-final"
+        )
+        for actual, expected in zip(runs, reference_runs):
+            self.assertEqual(actual.run_id, expected.run_id)
+            self.assertEqual(actual.metrics, expected.metrics)
+            self.assertEqual(actual.candidate_pool_digest, expected.candidate_pool_digest)
+            self.assertEqual(actual.scaler_digest, expected.scaler_digest)
+            self.assertEqual(
+                json.loads(Path(actual.details_path).read_text(encoding="utf-8"))["decisions"],
+                json.loads(Path(expected.details_path).read_text(encoding="utf-8"))["decisions"],
+            )
+
+    def test_final_test_rejects_corrupt_or_incompatible_checkpoints(self):
+        params = {
+            "random": {"random_seed": 42}, "popularity": {}, "greedy": {},
+            "epsilon_greedy": {"epsilon": 0.05, "random_seed": 42},
+            "linucb": {"alpha": 2.0},
+        }
+        config = validation_config(
+            mode="final_test", final_parameters=params, candidate_pool_depths=(100,),
+            results_directory=str(Path(self._temporary_root.name) / "final-results"),
+        )
+        checkpoint_directory = Path(self._temporary_root.name) / "corrupt-final"
+        ExperimentRunner(tiny_events(), config).run_final_test(checkpoint_directory)
+        marker = next(checkpoint_directory.glob("*.checkpoint.json"))
+        detail = checkpoint_directory / (marker.name.removesuffix(".checkpoint.json") + ".jsonl")
+        detail.write_text(detail.read_text(encoding="utf-8") + "corruption", encoding="utf-8")
+        resumed = ExperimentRunner(tiny_events(), config)
+        with self.assertRaisesRegex(CheckpointError, "checksum mismatch"):
+            resumed.run_final_test(checkpoint_directory)
+
+    def test_final_test_quarantines_unmarked_jsonl_and_reruns_that_configuration(self):
+        params = {
+            "random": {"random_seed": 42}, "popularity": {}, "greedy": {},
+            "epsilon_greedy": {"epsilon": 0.05, "random_seed": 42},
+            "linucb": {"alpha": 2.0},
+        }
+        config = validation_config(
+            mode="final_test", final_parameters=params, candidate_pool_depths=(100,),
+            results_directory=str(Path(self._temporary_root.name) / "final-results"),
+        )
+        checkpoint_directory = Path(self._temporary_root.name) / "orphan-final"
+        ExperimentRunner(tiny_events(), config).run_final_test(checkpoint_directory)
+        marker = next(checkpoint_directory.glob("*.checkpoint.json"))
+        marker.unlink()
+        resumed = ExperimentRunner(tiny_events(), config)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            runs = resumed.run_final_test(checkpoint_directory)
+        self.assertEqual(len(runs), 5)
+        self.assertEqual(resumed.resumed_run_count, 4)
+        self.assertTrue(any("quarantined uncommitted" in str(item.message) for item in caught))
+        self.assertEqual(len(tuple((checkpoint_directory / ".incomplete").glob("*.uncommitted"))), 1)
+        self.assertEqual(len(tuple(checkpoint_directory.glob("*.checkpoint.json"))), 5)
+
+    def test_final_test_rejects_corrupt_warmup_artifact(self):
+        params = {
+            "random": {"random_seed": 42}, "popularity": {}, "greedy": {},
+            "epsilon_greedy": {"epsilon": 0.05, "random_seed": 42},
+            "linucb": {"alpha": 2.0},
+        }
+        config = validation_config(
+            mode="final_test", final_parameters=params, candidate_pool_depths=(100,),
+            results_directory=str(Path(self._temporary_root.name) / "final-results"),
+        )
+        checkpoint_directory = Path(self._temporary_root.name) / "corrupt-warmup"
+        ExperimentRunner(tiny_events(), config).run_final_test(checkpoint_directory)
+        artifact = checkpoint_directory / "warmup-N100.json"
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        payload["scaler_mean"][0] += 1.0
+        artifact.write_text(json.dumps(payload), encoding="utf-8")
+        resumed = ExperimentRunner(tiny_events(), config)
+        with self.assertRaisesRegex(CheckpointError, "artifact checksum mismatch"):
+            resumed.run_final_test(checkpoint_directory)
+
+
+class FrozenSelectionArtifactTests(unittest.TestCase):
+    def test_frozen_final_config_and_manifest_hashes(self):
+        root = Path(__file__).resolve().parents[1]
+        config = ExperimentConfig.from_json(root / "experiments/configs/final_test.json")
+        manifest = json.loads(
+            (root / "experiments/configs/final_selection_manifest.json").read_text(encoding="utf-8")
+        )
+        digest = manifest.pop("manifest_sha256")
+        canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        self.assertEqual(hashlib.sha256(canonical.encode("utf-8")).hexdigest(), digest)
+        self.assertEqual(config.configuration_hash, manifest["final_test_config_hash"])
+        self.assertEqual(config.mode, "final_test")
+        self.assertEqual(config.candidate_pool_depths, (100,))
+        self.assertEqual(config.k_values, (5, 10, 20))
+        self.assertEqual(config.final_parameters["linucb"]["alpha"], 2.0)
+        self.assertEqual(config.final_parameters["epsilon_greedy"]["epsilon"], 0.05)
+        self.assertEqual(manifest["protocol_commit"], "c7167312f55fdacd86e4183bfd80a3d1b02d5b55")
+        self.assertEqual(manifest["experiment_commit"], "f67c7d9bdf2dfa24de0fe14221adb41c6f1e33a8")
+        self.assertEqual(
+            hashlib.sha256((root / "experiments/configs/final_test.json").read_bytes()).hexdigest(),
+            manifest["final_test_config_file_sha256"],
+        )
+        self.assertEqual(_experiment_code_digest(root), manifest["final_test_runner_source_digest"])
 
 
 class ValidationSelectionTests(unittest.TestCase):

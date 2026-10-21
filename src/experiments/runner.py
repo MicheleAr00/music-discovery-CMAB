@@ -23,12 +23,14 @@ import shutil
 import tempfile
 from time import perf_counter
 from typing import Any, Iterable, Mapping, Optional, Sequence
+import warnings
 
 from src.data.state import PlayEvent, TemporalState
 from src.evaluation.metrics import OfflineMetricsEvaluator
 from src.experiments.config import (
     DEFAULT_ALPHAS,
     DEFAULT_EPSILONS,
+    DEFAULT_POLICIES,
     PRIMARY_POOL_DEPTH,
     ExperimentConfig,
 )
@@ -56,9 +58,11 @@ from types import MappingProxyType
 
 
 _CHECKPOINT_FORMAT_VERSION = 1
+_WARMUP_ARTIFACT_FORMAT_VERSION = 1
 _CHECKPOINT_CODE_FILES = (
     "src/data/identity.py",
     "src/data/state.py",
+    "src/experiments/cli.py",
     "src/evaluation/metrics.py",
     "src/experiments/config.py",
     "src/experiments/dataset.py",
@@ -395,6 +399,7 @@ class ExperimentRunner:
         # run still owns fresh state, candidate index, scaler, and policy.
         self._warmup_artifacts: dict[int, _WarmupArtifact] = {}
         self.checkpoint_directory: Optional[Path] = None
+        self.final_test_warmup_fit_seconds: Optional[float] = None
         self.resumed_run_count = 0
         self.recovery_warmup_seconds: dict[int, float] = {}
         # Detailed validation decisions are spooled per run. Keeping the
@@ -499,9 +504,7 @@ class ExperimentRunner:
         if len(set(expected_run_ids)) != len(expected_run_ids):
             raise RuntimeError("validation grid generated duplicate run identifiers")
 
-        completed = self._load_validation_checkpoints(
-            checkpoint_root, planned
-        )
+        completed = self._load_checkpoints(checkpoint_root, planned, "validation")
         runs: list[ExperimentRun] = []
         pool_traces: dict[int, tuple[str, str]] = {}
         for depth in self.config.candidate_pool_depths:
@@ -549,7 +552,7 @@ class ExperimentRunner:
                     full_run = replace(
                         full_run, runtime_seconds=perf_counter() - run_started
                     )
-                    self._write_validation_checkpoint(checkpoint_root, full_run)
+                    self._write_run_checkpoint(checkpoint_root, full_run)
                     run = self._compact_checkpoint_run(
                         full_run, checkpoint_root / f"{run_id}.jsonl"
                     )
@@ -666,6 +669,98 @@ class ExperimentRunner:
             scaler_digest=self._scaler_digest(mean, scale),
         )
 
+    def _warmup_artifact_path(self, checkpoint_root: Path, depth: int) -> Path:
+        return checkpoint_root / f"warmup-N{depth}.json"
+
+    def _save_warmup_artifact(
+        self, checkpoint_root: Path, artifact: _WarmupArtifact, fit_seconds: float
+    ) -> Path:
+        """Persist immutable scaler parameters and their experiment provenance."""
+        payload: dict[str, Any] = {
+            "artifact_format_version": _WARMUP_ARTIFACT_FORMAT_VERSION,
+            "configuration_hash": artifact.configuration_hash,
+            "dataset_content_hash": artifact.dataset_content_hash,
+            "experiment_code_digest": self.experiment_code_digest,
+            "git_commit": self.git_commit,
+            "candidate_pool_depth": artifact.candidate_pool_depth,
+            "warmup_start": artifact.warmup_start.isoformat(),
+            "warmup_end": artifact.warmup_end.isoformat(),
+            "session_gap_seconds": artifact.session_gap.total_seconds(),
+            "warmup_result": asdict(artifact.result),
+            "scaler_mean": list(artifact.scaler_mean),
+            "scaler_scale": list(artifact.scaler_scale),
+            "scaler_digest": artifact.scaler_digest,
+            "fit_runtime_seconds": fit_seconds,
+        }
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        payload["artifact_sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        path = self._warmup_artifact_path(checkpoint_root, artifact.candidate_pool_depth)
+        def write_artifact(stream) -> None:
+            json.dump(payload, stream, sort_keys=True, ensure_ascii=False)
+            stream.write("\n")
+
+        _atomic_write(path, write_artifact)
+        return path
+
+    def _load_warmup_artifact(
+        self, checkpoint_root: Path, depth: int
+    ) -> tuple[_WarmupArtifact, float]:
+        """Load only a complete, checksummed artifact from the exact run identity."""
+        path = self._warmup_artifact_path(checkpoint_root, depth)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CheckpointError(f"corrupt final-test warm-up artifact {path}") from exc
+        if not isinstance(payload, dict):
+            raise CheckpointError(f"final-test warm-up artifact must contain an object: {path}")
+        artifact_hash = payload.pop("artifact_sha256", None)
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        if artifact_hash != hashlib.sha256(canonical.encode("utf-8")).hexdigest():
+            raise CheckpointError(f"final-test warm-up artifact checksum mismatch: {path}")
+        expected = {
+            "artifact_format_version": _WARMUP_ARTIFACT_FORMAT_VERSION,
+            "configuration_hash": self.config.configuration_hash,
+            "dataset_content_hash": self.dataset_content_hash,
+            "experiment_code_digest": self.experiment_code_digest,
+            "git_commit": self.git_commit,
+            "candidate_pool_depth": depth,
+            "warmup_start": self.config.temporal.warmup_bounds[0].isoformat(),
+            "warmup_end": self.config.temporal.warmup_bounds[1].isoformat(),
+            "session_gap_seconds": self.config.temporal.session_gap.total_seconds(),
+        }
+        for name, value in expected.items():
+            if payload.get(name) != value:
+                raise CheckpointError(
+                    f"final-test warm-up artifact is incompatible: {name} differs"
+                )
+        try:
+            summary = WarmupResult(**payload["warmup_result"])
+            mean = tuple(float(value) for value in payload["scaler_mean"])
+            scale = tuple(float(value) for value in payload["scaler_scale"])
+            fit_seconds = float(payload["fit_runtime_seconds"])
+            scaler_digest = str(payload["scaler_digest"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CheckpointError(f"final-test warm-up artifact has invalid contents: {path}") from exc
+        if not math.isfinite(fit_seconds) or fit_seconds < 0:
+            raise CheckpointError(f"final-test warm-up artifact has invalid timing: {path}")
+        if self._scaler_digest(mean, scale) != scaler_digest:
+            raise CheckpointError(f"final-test warm-up artifact scaler digest mismatch: {path}")
+        warm_start, warm_end = self.config.temporal.warmup_bounds
+        artifact = _WarmupArtifact(
+            configuration_hash=self.config.configuration_hash,
+            dataset_content_hash=self.dataset_content_hash,
+            candidate_pool_depth=depth,
+            warmup_start=warm_start,
+            warmup_end=warm_end,
+            session_gap=self.config.temporal.session_gap,
+            result=summary,
+            scaler_mean=mean,
+            scaler_scale=scale,
+            scaler_digest=scaler_digest,
+        )
+        self._validate_warmup_artifact(artifact, depth, warm_start, warm_end)
+        return artifact, fit_seconds
+
     def _checkpoint_identity(self, run: ExperimentRun) -> dict[str, Any]:
         eligible_hash = hashlib.sha256(
             "\n".join(sorted(run.eligible_users)).encode("utf-8")
@@ -688,7 +783,7 @@ class ExperimentRunner:
             "candidate_pool_digest": run.candidate_pool_digest,
         }
 
-    def _write_validation_checkpoint(
+    def _write_run_checkpoint(
         self, checkpoint_root: Path, run: ExperimentRun
     ) -> None:
         detail_path = checkpoint_root / f"{run.run_id}.jsonl"
@@ -728,16 +823,17 @@ class ExperimentRunner:
 
         _atomic_write(marker_path, write_marker)
 
-    def _load_validation_checkpoints(
+    def _load_checkpoints(
         self,
         checkpoint_root: Path,
         planned: Sequence[tuple[int, str, dict[str, Any], str]],
+        phase: str,
     ) -> dict[str, dict[str, Any]]:
         expected = {row[3]: row for row in planned}
         stale_temporary = tuple(checkpoint_root.glob("*.tmp")) + tuple(
             checkpoint_root.glob(".*.tmp")
         )
-        if stale_temporary:
+        if stale_temporary and phase != "test":
             raise CheckpointError(
                 "incomplete atomic checkpoint write found: "
                 + ", ".join(path.name for path in stale_temporary)
@@ -748,10 +844,36 @@ class ExperimentRunner:
             path for path in checkpoint_root.glob("*.jsonl")
             if path.stem not in marker_ids
         )
-        if orphan_details:
+        if orphan_details and phase != "test":
             raise CheckpointError(
                 "checkpoint detail file has no completion marker: "
                 + ", ".join(path.name for path in orphan_details)
+            )
+        if phase == "test" and (stale_temporary or orphan_details):
+            planned_ids = {row[3] for row in planned}
+            unknown_orphans = [path.name for path in orphan_details if path.stem not in planned_ids]
+            if unknown_orphans:
+                raise CheckpointError(
+                    "unmarked final-test details do not belong to this configuration: "
+                    + ", ".join(unknown_orphans)
+                )
+            quarantine = checkpoint_root / ".incomplete"
+            quarantine.mkdir(exist_ok=True)
+            moved: list[str] = []
+            for path in (*stale_temporary, *orphan_details):
+                checksum = _sha256_file(path)
+                destination = quarantine / f"{path.name}.{checksum[:12]}.uncommitted"
+                if destination.exists():
+                    raise CheckpointError(
+                        f"incomplete checkpoint quarantine target already exists: {destination}"
+                    )
+                os.replace(path, destination)
+                moved.append(path.name)
+            warnings.warn(
+                "quarantined uncommitted final-test files and will rerun those configurations: "
+                + ", ".join(moved),
+                RuntimeWarning,
+                stacklevel=2,
             )
 
         completed: dict[str, dict[str, Any]] = {}
@@ -782,7 +904,7 @@ class ExperimentRunner:
                 "dataset_content_hash": self.dataset_content_hash,
                 "experiment_code_digest": self.experiment_code_digest,
                 "git_commit": self.git_commit,
-                "evaluation_phase": "validation",
+                "evaluation_phase": phase,
                 "policy": policy_name,
                 "policy_parameters": params,
                 "candidate_pool_depth": depth,
@@ -814,7 +936,7 @@ class ExperimentRunner:
                 "dataset_content_hash": self.dataset_content_hash,
                 "git_commit": self.git_commit,
                 "experiment_code_digest": self.experiment_code_digest,
-                "evaluation_phase": "validation",
+                "evaluation_phase": phase,
                 "policy": policy_name,
                 "policy_parameters": json.dumps(params, sort_keys=True),
                 "candidate_pool_depth": depth,
@@ -945,8 +1067,15 @@ class ExperimentRunner:
             spool.cleanup()
         self._validation_spools.clear()
 
-    def run_final_test(self) -> tuple[ExperimentRun, ...]:
-        """Run one explicitly selected, common-N parameterization per policy."""
+    def run_final_test(
+        self, checkpoint_directory: str | Path | None = None
+    ) -> tuple[ExperimentRun, ...]:
+        """Run or resume the five explicitly selected N=100 test policies.
+
+        Warm-up contexts and scaler parameters are prepared once and persisted
+        with provenance. Each policy receives a fresh state and simulator;
+        completed policy records are atomically checkpointed before continuing.
+        """
         if self.config.mode != "final_test":
             raise ValueError("run_final_test requires mode='final_test'")
         if self._final_test_completed:
@@ -957,26 +1086,101 @@ class ExperimentRunner:
             raise ValueError("final_test requires exactly one selected candidate_pool_depth")
         if self.config.candidate_pool_depths != (PRIMARY_POOL_DEPTH,):
             raise ValueError("final_test requires the common primary candidate_pool_depth N=100")
+        if set(self.config.policies) != set(DEFAULT_POLICIES):
+            raise ValueError("final_test requires exactly the five frozen policies")
         missing = set(self.config.policies) - set(self.config.final_parameters)
         extra = set(self.config.final_parameters) - set(self.config.policies)
         if missing or extra:
             raise ValueError(f"final_parameters must match policies; missing={sorted(missing)}, extra={sorted(extra)}")
         depth = self.config.candidate_pool_depths[0]
+        planned: list[tuple[int, str, dict[str, Any], str]] = []
+        for policy_name in self.config.policies:
+            params = self._normalized_policy_parameters(
+                policy_name, self.config.final_parameters[policy_name]
+            )
+            run_id = self._run_identifier("test", policy_name, params, depth)
+            planned.append((depth, policy_name, params, run_id))
+        if len({row[3] for row in planned}) != len(planned):
+            raise CheckpointError("final-test configuration generated duplicate run identifiers")
+        checkpoint_root = self._resolve_checkpoint_directory(checkpoint_directory)
+        self.checkpoint_directory = checkpoint_root
+        completed = self._load_checkpoints(checkpoint_root, planned, "test")
+        self.resumed_run_count = len(completed)
+
+        artifact_path = self._warmup_artifact_path(checkpoint_root, depth)
+        if artifact_path.exists():
+            artifact, fit_seconds = self._load_warmup_artifact(checkpoint_root, depth)
+        else:
+            if completed:
+                # A complete run marker without the shared scaler artifact is
+                # insufficient provenance; rebuild once, then verify digests.
+                fit_started = perf_counter()
+                artifact = self._build_warmup_artifact(depth)
+                fit_seconds = perf_counter() - fit_started
+            else:
+                fit_started = perf_counter()
+                artifact = self._build_warmup_artifact(depth)
+                fit_seconds = perf_counter() - fit_started
+            self._save_warmup_artifact(checkpoint_root, artifact, fit_seconds)
+        self._warmup_artifacts[depth] = artifact
+        self.final_test_warmup_fit_seconds = fit_seconds
+
         runs: list[ExperimentRun] = []
         expected_signatures = None
-        for policy_name in self.config.policies:
-            params = dict(self.config.final_parameters[policy_name])
+        first_run_id = planned[0][3]
+        fit_time_charged = first_run_id in completed
+        for _, policy_name, params, run_id in planned:
             if policy_name == "linucb" and float(params.get("alpha", -1.0)) not in DEFAULT_ALPHAS:
                 raise ValueError(f"final LinUCB alpha must come from {DEFAULT_ALPHAS}")
             if policy_name == "epsilon_greedy" and float(params.get("epsilon", -1.0)) not in DEFAULT_EPSILONS:
                 raise ValueError(f"final epsilon must come from {DEFAULT_EPSILONS}")
-            run = self._run_one("test", policy_name, params, depth)
+            cached = completed.get(run_id)
+            if cached is not None:
+                if cached["identity"].get("scaler_digest") != artifact.scaler_digest:
+                    raise CheckpointError(
+                        f"final-test checkpoint {run_id} scaler digest differs from warm-up artifact"
+                    )
+                warmup_summary = cached["summary"]
+                expected_warmup = {
+                    "warmup_decision_points": artifact.result.decision_points,
+                    "warmup_context_rows": artifact.result.context_rows,
+                    "warmup_state_events_processed": artifact.result.state_events_processed,
+                }
+                if any(
+                    warmup_summary.get(name) != value
+                    for name, value in expected_warmup.items()
+                ):
+                    raise CheckpointError(
+                        f"final-test checkpoint {run_id} warm-up summary differs from artifact"
+                    )
+                run = self._restore_checkpoint_run(cached, checkpoint_root / f"{run_id}.jsonl")
+            else:
+                run = self._run_one(
+                    "test", policy_name, params, depth, warmup_artifact=artifact
+                )
+                if run.run_id != run_id:
+                    raise CheckpointError("final-test run identifier differs from its plan")
+                if run_id == first_run_id and not fit_time_charged:
+                    run = replace(
+                        run,
+                        runtime_seconds=run.runtime_seconds + fit_seconds,
+                        warmup_runtime_seconds=run.warmup_runtime_seconds + fit_seconds,
+                    )
+                    fit_time_charged = True
+                self._write_run_checkpoint(checkpoint_root, run)
+                run = self._compact_checkpoint_run(
+                    run, checkpoint_root / f"{run_id}.jsonl"
+                )
             signatures = (run.candidate_pool_digest, run.scaler_digest)
             if expected_signatures is None:
                 expected_signatures = signatures
             elif expected_signatures != signatures:
                 raise RuntimeError("fairness violation: final-test candidate pools or scaler differ across policies")
             runs.append(run)
+        observed_ids = [run.run_id for run in runs]
+        expected_ids = [row[3] for row in planned]
+        if len(observed_ids) != len(set(observed_ids)) or set(observed_ids) != set(expected_ids):
+            raise CheckpointError("final-test aggregation is incomplete or contains duplicate runs")
         self._final_test_completed = True
         return tuple(runs)
 
@@ -1329,11 +1533,13 @@ class ExperimentRunner:
         jsonl_path = directory / "runs.jsonl"
         rows = [run.summary_row(self.config) for run in runs]
         fieldnames = sorted({name for row in rows for name in row})
-        with csv_path.open("w", newline="", encoding="utf-8") as stream:
+
+        def write_csv(stream) -> None:
             writer = csv.DictWriter(stream, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
-        with jsonl_path.open("w", encoding="utf-8") as stream:
+
+        def write_jsonl(stream) -> None:
             for run in runs:
                 if run.details_path is not None:
                     if not Path(run.details_path).is_file():
@@ -1344,4 +1550,6 @@ class ExperimentRunner:
                         shutil.copyfileobj(detail_stream, stream)
                 else:
                     _write_run_json_line(stream, run, self.config)
+        _atomic_write(csv_path, write_csv)
+        _atomic_write(jsonl_path, write_jsonl)
         return csv_path, jsonl_path
