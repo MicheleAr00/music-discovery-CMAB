@@ -1,0 +1,3 @@
+src/experiments/config.py text eol=lf
+experiments/configs/validation.json text eol=lf
+experiments/configs/final_test.json text eol=crlf

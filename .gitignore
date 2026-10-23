@@ -220,6 +220,8 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Dataset
+dataset/
+# Local compatibility alias for frozen experiment configs
 Dataset/
 
 # Python

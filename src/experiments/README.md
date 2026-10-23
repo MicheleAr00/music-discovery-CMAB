@@ -6,6 +6,19 @@ keeps the frozen warm-up/validation/test dates, seven-day reward horizon,
 ten-minute session gap, pool depths, K values, and policy sweep ranges in one
 place.
 
+The frozen experiment JSON files and the `ExperimentConfig` default keep the
+historical `Dataset/...` path so their configuration and runner provenance
+remain unchanged. The local dataset directory is named `dataset/`. Windows
+resolves this case-only path difference directly. On a case-sensitive
+filesystem, create a local alias in the repository root before using the
+frozen configurations or the default:
+
+```sh
+ln -s dataset Dataset
+```
+
+Both the dataset directory and the compatibility alias are ignored by Git.
+
 ```python
 from src.experiments import ExperimentConfig, ExperimentRunner
 from src.experiments.dataset import load_lastfm_tsv
