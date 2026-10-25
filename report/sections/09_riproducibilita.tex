@@ -1,0 +1,34 @@
+\chapter{Tracciabilità e griglia completa}\label{app:repro}
+La relazione legge gli aggregati ufficiali senza rieseguire le policy. Lo script \path{report/build_assets.py} costruisce tabelle e grafici dai CSV, estrae figure EDA dagli output incorporati, verifica la cache qualitativa e conserva le tabelle statistiche già calcolate. Le fonti sono:
+\begin{quote}\small
+\path{experiments/results/validation/ea8616724509-5b076e7a/runs.csv}\\
+\path{experiments/results/test/044f9269d4e3-5b076e7a/runs.csv}\\
+\path{experiments/configs/final_selection_manifest.json}\\
+\path{notebooks/03_statistical_analysis.ipynb}\\
+\path{notebooks/data/qualitative_examples.json}
+\end{quote}
+Il dataset canonico ha SHA-256
+\begin{quote}\small\path{5b076e7a1cb3646f58499d53976630528ecd9ac1a2431cb9f8c919a768c7a04a}.\end{quote}
+Gli hash logici delle configurazioni sono
+\begin{quote}\small
+Validation: \path{ea8616724509edd297d13b5c83a38b14bb758d3148323a51fe123d997ec835f6}\\
+Test: \path{044f9269d4e3820b8a2ff3e23bd6e191878ccfc421bc6532ac8f5d2ab15b983b}.
+\end{quote}
+La validation fa riferimento al commit \metric{f67c7d9}; il test al checkout \metric{4cd1fe0}, con preparazione del runner \metric{341f047}. Il manifesto conserva gli ID delle run selezionate prima del test. I digest completi degli input della relazione e gli ID delle 36+5 run sono in \metric{report/data/provenance.json}. Queste evidenze collegano le tabelle agli aggregati; non costituiscono una nuova verifica byte per byte dei molti gigabyte dei JSONL dettagliati.
+
+La predefinizione dello scenario principale è verificabile nel commit del 7 ottobre 2026
+\begin{quote}\small\path{c7167312f55fdacd86e4183bfd80a3d1b02d5b55}.\end{quote}
+Il README del runner, righe 38--56 in quella revisione, fissa $N=100$ a priori, limita $N=50/200$ alla sensibilità e riserva la selezione a NDCG@10, poi reward e parametro minore. Configurazione e selettore della stessa revisione applicano quei vincoli. È documentazione antecedente ai risultati, non una preregistrazione formale.
+
+Le configurazioni storiche mantengono il testo \metric{Dataset/...}, mentre la directory fisica è \metric{dataset}. Windows risolve la differenza di maiuscola; su filesystem case-sensitive si usa l'alias locale documentato. I dati delle run storiche e i loro hash non vengono rigenerati per adattarli al nome della directory.
+
+I checkpoint persistenti verificano identità, seed e digest di ogni run. Il marker atomico segue il JSONL e ne conserva il checksum. La ripresa accetta solo run complete, ricostruisce istanze indipendenti e impedisce duplicazioni nell'aggregato.
+
+\begin{table}[htbp]\centering\scriptsize
+\input{tables/validation_coverage}
+\caption{Coverage della validation principale per le configurazioni congelate, con cutoff espliciti.}
+\end{table}
+
+\clearpage\small
+\input{tables/grid}
+\normalsize

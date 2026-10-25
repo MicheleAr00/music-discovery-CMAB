@@ -1,0 +1,40 @@
+\chapter{Incertezza e confronti appaiati}\label{ch:stat}
+\section{Unità di ricampionamento e verifica delle metriche}
+Le 82.905 decisioni non sono osservazioni indipendenti. Due sessioni dello stesso utente condividono preferenze, storia e spesso finestre future sovrapposte. Un bootstrap delle singole decisioni frammenterebbe artificialmente questa dipendenza e non riprodurrebbe la macro-aggregazione ufficiale. Il notebook statistico impiega perciò l'utente come unità di ricampionamento \cite{efron1993,field2007}. Il riferimento al bootstrap per cluster motiva tale scelta, senza garantire validità sotto qualsiasi dipendenza fra utenti.
+
+Prima dell'inferenza, i checkpoint vengono allineati per utente e timestamp fra tutte le policy. Gli ascolti originali consentono di ricostruire il set di artisti rilevanti in $(t,t+7d]$; il ranking viene deduplicato con la prima occorrenza e IDCG segue l'Equazione~\ref{eq:ndcg}. Le medie utente ricostruite vengono confrontate agli aggregati per reward, NDCG, track novelty, artist novelty e ILD a @5, @10 e @20. Il notebook impone tolleranza assoluta $10^{-12}$ e relativa zero; la reward coincide anche a livello di decisione, con errore massimo registrato pari a zero.
+
+Questa verifica è essenziale: una formula apparentemente simile potrebbe usare un diverso denominatore IDCG, trattare i duplicati come item distinti o pesare gli utenti in funzione delle loro sessioni. In tali casi gli intervalli descriverebbero una metrica diversa da quella selezionata in validation. La coverage globale non viene trasformata impropriamente in media individuale e non riceve gli intervalli seguenti.
+
+L'inferenza completa quindi la verifica dell'obiettivo: la vicinanza delle medie non prova equivalenza dell'accuratezza, così come un incremento puntuale di novelty non ne descrive da solo l'incertezza fra utenti.
+
+\section{Bootstrap appaiato}
+Per ciascuna metrica si dispone del vettore delle 562 medie utente $\overline M^\pi_u$ della policy $\pi$. In ogni replica $b$ si estraggono con reinserimento 562 indici utente, usando gli stessi indici per tutte le policy:
+\begin{align}
+\widehat M_b^\pi&=\frac1{562}\sum_{j=1}^{562}\overline M^\pi_{u_j^{(b)}},\\
+\widehat\delta_b^{\pi,\rho}
+&=\frac1{562}\sum_{j=1}^{562}
+\left(\overline M^\pi_{u_j^{(b)}}-\overline M^\rho_{u_j^{(b)}}\right).
+\end{align}
+Ogni media utente mantiene insieme tutta la sua sequenza temporale. Il notebook usa 10.000 replicazioni, seed 20261022 e quantili percentile 0,025 e 0,975. Non si sottraggono gli estremi di due intervalli marginali: la differenza è calcolata su coppie dello stesso utente, preservando la covariazione fra policy.
+
+\begin{table}[htbp]\centering\small
+\input{tables/paired_ci}
+\caption{LinUCB $\alpha=2$ meno Personalized Greedy nel test: differenze appaiate e IC bootstrap al 95\% (percentile), dagli output verificati del notebook statistico.}\label{tab:ci}
+\end{table}
+
+\section{Interpretazione degli effetti}
+Per NDCG@10 la differenza puntuale è $-0{,}001055$ e l'intervallo include zero. I dati e questo metodo non permettono di affermare una differenza direzionale affidabile fra LinUCB e Greedy. L'assenza di evidenza non è prova di equivalenza: questa richiederebbe margini di equivalenza motivati prima dell'analisi e una procedura dedicata. È corretto descrivere vicinanza numerica, dichiarandone l'incertezza.
+
+Per Average Reward la differenza è $-0{,}059984$ e l'intervallo $[-0{,}091307;-0{,}028959]$ esclude zero. Il minor proxy medio di LinUCB è quindi più stabile rispetto alla variabilità fra utenti. Il risultato riguarda una differenza nella media di $\ln(1+n)$, non una perdita pari a 0,06 ascolti e neppure una percentuale causale di soddisfazione.
+
+TN, AN e ILD presentano incrementi con intervalli interamente positivi. Gli effetti sono espressi nelle unità naturali delle metriche: per esempio $+0{,}108348$ di TN corrisponde a circa 10,83 punti percentuali, non al 10,83\% relativo. L'incremento di AN è particolarmente interpretabile perché Greedy ha AN@10 pari a zero.
+
+\figura{paired_ci.pdf}{1}{Differenze appaiate LinUCB meno Greedy con IC bootstrap al 95\%. Le tre scale orizzontali separano reward, NDCG e composizione delle liste; lo zero tratteggiato è il riferimento di ciascun pannello. I valori esatti sono nella Tabella~\ref{tab:ci}, senza costruire un'utilità complessiva.}{fig:ci}
+
+Rispetto a $\varepsilon$-Greedy, LinUCB ha $\Delta$ NDCG@10 $+0{,}008848$, IC bootstrap al 95\% $[0{,}003464;0{,}014129]$. La differenza di reward è $-0{,}016644$, IC bootstrap al 95\% $[-0{,}046835;0{,}013173]$, quindi non è chiaramente direzionale secondo questo intervallo. Anche in questo confronto novelty e ILD favoriscono numericamente LinUCB; non si usa l'inferenza per scegliere retroattivamente un nuovo modello.
+
+\section{Limiti dell'inferenza}
+L'analisi è post-hoc. Le metriche e i confronti sono correlati e gli intervalli sono nominali, senza correzioni per confronti multipli. Un intervallo che esclude zero non equivale a una garanzia simultanea su tutte le conclusioni. Le finestre temporali condivise fra utenti, le mode musicali e il modello LinUCB comune possono generare dipendenze fra cluster che il bootstrap per utente non rappresenta.
+
+Si ricampionano le prestazioni di traiettorie già prodotte, senza riaddestrare la policy per ogni replica: l'incertezza è condizionata al protocollo, alla popolazione, al seed e all'esecuzione congelata. Non include tutta la variabilità da un nuovo training o da un nuovo scenario temporale. Un'analisi futura potrebbe considerare blocchi temporali comuni e repliche predefinite con più seed, ma tali esperimenti non sono stati eseguiti per questa relazione.

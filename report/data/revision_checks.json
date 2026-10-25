@@ -1,0 +1,37 @@
+{
+  "review_date": "2026-10-23",
+  "protected_small_files_unchanged": 139,
+  "detailed_jsonl_metadata_unchanged": 101,
+  "detailed_jsonl_rehashed": false,
+  "numerical_tables_byte_identical": 13,
+  "statistical_tables_byte_identical": true,
+  "official_sources_unchanged": true,
+  "global_popularity_paragraph_physical_page": 16,
+  "pages": 25,
+  "warnings": [],
+  "cache_sha256": "ed582fc9a26189785bf440be58b0a4ee9a419c77e20c8131bf0ea6ed7840341b",
+  "source_hashes": {
+    "experiments/configs/final_selection_manifest.json": "f7d5f9fdbcb36ec4cd15f067aca4632e8895fee4fdfb803e3a4d6d692fdf78b1",
+    "experiments/configs/final_test.json": "76e59cefb025579b84f75f4e691387059e76b11b4a08b1c778109c1dabaad40c",
+    "experiments/configs/validation.json": "8e855214ba70b7439b781d4aac9a0f0fcba4e89c44e7b312a95796b1343715f2",
+    "experiments/results/validation/ea8616724509-5b076e7a/runs.csv": "60a08c3da9f51b3818061f915b2302d81359f642daa8ec9a9474e93d9cb49b5d",
+    "experiments/results/test/044f9269d4e3-5b076e7a/runs.csv": "7089ff59433a1725254da3f5cdd4157fafbe8a11d0140f108cabf18385a27831"
+  },
+  "scientific_module_diff_against_validation_commit": "empty",
+  "protected_baseline_path": "build/revision-baseline.json",
+  "operations_not_performed": [
+    "dataset scans",
+    "policy execution",
+    "new bootstrap",
+    "validation",
+    "held-out test",
+    "commit",
+    "push"
+  ],
+  "pdf_sha256": "ff98e332ec482899c888712bd671bc901c457d2a2663766a93bdfa1596d786db",
+  "all_pages_visually_inspected": true,
+  "final_index_rechecked": true,
+  "git_diff_check": "passed",
+  "report_source_whitespace_check": "passed",
+  "source_changes_scope": "report/ only; pre-existing report work preserved"
+}

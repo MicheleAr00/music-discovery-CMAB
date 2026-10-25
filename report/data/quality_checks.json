@@ -1,0 +1,19 @@
+{
+  "pages": 27,
+  "warnings": [],
+  "labels": 31,
+  "references": 13,
+  "citations": [
+    "auer2002",
+    "efron1993",
+    "field2007",
+    "jarvelin2002",
+    "lastfm",
+    "li2010",
+    "li2010offline",
+    "vargas2011",
+    "ziegler2005"
+  ],
+  "missing_references": [],
+  "missing_citations": []
+}
