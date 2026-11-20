@@ -235,3 +235,8 @@ venv/
 
 # Experiment outputs
 experiments/results/
+
+# Local report sources, build artifacts and archive
+/report/*
+!/report/music_discovery_cmab.pdf
+/report.zip

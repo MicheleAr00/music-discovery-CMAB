@@ -20,7 +20,7 @@ Official held-out results at **N=100**, across **562 users and 82,905 decision p
 | Random | 0.058348 | 0.083866 | 0.881662 | 0.465040 | 0.993400 |
 | Global Popularity | 0.036927 | 0.266868 | 0.650198 | 0.220333 | 0.000000 |
 
-Source: [versioned summary derived from the official test aggregate](report/data/test_summary.csv); input hashes and run identifiers are recorded in [report provenance](report/data/provenance.json).
+Source: [versioned summary derived from the official test aggregate](experiments/summaries/test_summary.csv); input hashes and run identifiers are recorded in [report provenance](experiments/summaries/provenance.json).
 
 LinUCB recommends more unheard tracks and artists, with greater artist diversity than Personalized Greedy, while achieving numerically close NDCG@10 and lower Average Reward. The paired-user 95% bootstrap interval for the NDCG@10 difference, LinUCB minus Greedy, is **[−0.006601, +0.004389]**: this does not establish statistical equivalence. Reward is a logarithmic offline proxy, not a listening count or a causal measure of satisfaction.
 
@@ -122,9 +122,10 @@ Post-hoc uncertainty analysis uses **10,000 paired bootstrap resamples of the 56
 │   └── experiments/   # Configuration, TSV loader, runner, CLI, checkpoints
 ├── experiments/
 │   ├── configs/       # Frozen validation/test configuration and selection
+│   ├── summaries/     # Derived results, statistical tables and provenance
 │   └── FINAL_TEST_PROCEDURE.md
 ├── notebooks/         # Executed analyses and compact qualitative cache
-├── report/            # Final PDF, LaTeX, figures, tables and derived summaries
+├── report/            # Final report PDF
 ├── docs/assets/       # README image derived from an existing report figure
 └── tests/             # Unit and integration tests
 ```
@@ -133,7 +134,7 @@ Post-hoc uncertainty analysis uses **10,000 paired bootstrap resamples of the 56
 
 ### Environment
 
-The experimental environment used **Python 3.13**. The core simulator and tests use the Python standard library, including SQLite. Notebook analysis additionally uses NumPy, pandas, Matplotlib, Seaborn, IPython, and Jupyter. The tracked `requirements.txt.txt` is empty; dependencies are not currently version-pinned.
+The experimental environment used **Python 3.13**. The core simulator and tests use the Python standard library, including SQLite. Notebook analysis additionally uses NumPy, pandas, Matplotlib, Seaborn, IPython, and Jupyter.
 
 From the repository root, create an environment:
 
@@ -161,10 +162,9 @@ $env:TEMP = $env:TMP = $env:TMPDIR = (Resolve-Path .pytest-tmp).Path
 
 - Read the PDF and saved notebook tables/plots without the dataset.
 - Regenerate the qualitative section of notebook 02 from its verified, versioned cache, using the relevant cells only.
-- Compile the report from its included figures and tables; see [report build instructions](report/README.md).
 - Run the standard-library test suite with `python -m unittest discover -s tests`.
 
-Full analysis recomputation needs the original dataset and/or official aggregate and checkpoint files, depending on the notebook. These large artifacts are not included; downloading Last.fm alone does not provide the historical experiment outputs. Small derived summaries and provenance are included in [report/data](report/data).
+Full analysis recomputation needs the original dataset and/or official aggregate and checkpoint files, depending on the notebook. These large artifacts are not included; downloading Last.fm alone does not provide the historical experiment outputs. Small derived summaries and provenance are included in [experiments/summaries](experiments/summaries).
 
 Full validation/test reproduction takes substantial CPU time and multiple gigabytes of temporary and persistent storage. It is separate from browsing the project or rendering qualitative examples. Consult the [runner documentation](src/experiments/README.md) and [frozen test start/resume procedure](experiments/FINAL_TEST_PROCEDURE.md) before deliberately reproducing an experiment; checkpoints are bound to dataset, configuration, and experiment code identity.
 
@@ -188,15 +188,15 @@ One of five fixed examples compares the same user and timestamp across Personali
 
 **U04, 2009-04-09 15:08:15.** Green marks artists absent from the user's strict-past history; a dark outline marks Top-1. LinUCB's list differs substantially here, but its Top-1 proxy reward is zero. A single example illustrates list composition, not an overall performance claim.
 
-The image is a PNG rendering of the [original report figure](report/figures/qualitative_U04.pdf). The [compact qualitative cache](notebooks/data/qualitative_examples.json), checked against its [SHA-256 sidecar](notebooks/data/qualitative_examples.json.sha256), contains five examples and 150 recommendations. It supports rendering without large result files or a dataset scan. Exact per-example **track** novelty is not reconstructed; aggregated Track Novelty remains available in the official metrics. [The cache-building script](notebooks/build_qualitative_cache.py) documents regeneration from existing official artifacts without rerunning policies.
+The image is a PNG rendering of the figure in the final report. The [compact qualitative cache](notebooks/data/qualitative_examples.json), checked against its [SHA-256 sidecar](notebooks/data/qualitative_examples.json.sha256), contains five examples and 150 recommendations. It supports rendering without large result files or a dataset scan. Exact per-example **track** novelty is not reconstructed; aggregated Track Novelty remains available in the official metrics. [The cache-building script](notebooks/build_qualitative_cache.py) documents regeneration from existing official artifacts without rerunning policies.
 
 ## Technical Report
 
 The final report, in Italian, develops the methodology, engineering choices, results, uncertainty analysis, and limitations:
 
 - [Final PDF](report/music_discovery_cmab.pdf)
-- [LaTeX entry point](report/main.tex) and [build instructions](report/README.md)
-- [Sources, hashes and run provenance](report/data/provenance.json)
+- [Validation summary](experiments/summaries/validation_summary.csv), [test summary](experiments/summaries/test_summary.csv), and [statistical tables](experiments/summaries/statistical_tables.json)
+- [Sources, hashes and run provenance](experiments/summaries/provenance.json)
 
 ## Limitations
 
@@ -214,4 +214,4 @@ The final report, in Italian, develops the methodology, engineering choices, res
 - Järvelin and Kekäläinen (2002). [Cumulated Gain-Based Evaluation of IR Techniques](https://doi.org/10.1145/582415.582418).
 - Vargas and Castells (2011). [Rank and Relevance in Novelty and Diversity Metrics for Recommender Systems](https://doi.org/10.1145/2043932.2043955).
 
-See the [report bibliography](report/references.bib) for the full methodological references.
+See the bibliography in the [final report](report/music_discovery_cmab.pdf) for the full methodological references.
